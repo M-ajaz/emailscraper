@@ -1,0 +1,1223 @@
+import { useState, useEffect, useCallback, useRef, memo } from "react";
+
+const API = (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) || "http://localhost:8000";
+
+// ─── Theme & Design Tokens ──────────────────────────────────────────────────
+const theme = {
+  bg: "#0a0e17",
+  surface: "#111827",
+  surfaceHover: "#1a2236",
+  border: "#1e293b",
+  borderActive: "#3b82f6",
+  text: "#e2e8f0",
+  textMuted: "#64748b",
+  textDim: "#475569",
+  accent: "#3b82f6",
+  accentGlow: "rgba(59,130,246,0.15)",
+  success: "#10b981",
+  warning: "#f59e0b",
+  danger: "#ef4444",
+  purple: "#8b5cf6",
+};
+
+// ─── Debounce Hook ──────────────────────────────────────────────────────────
+function useDebounce(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+}
+
+// ─── Utility Components ─────────────────────────────────────────────────────
+const Spinner = () => (
+  <div style={{ display: "flex", justifyContent: "center", padding: 40 }}>
+    <div
+      style={{
+        width: 32, height: 32, border: `3px solid ${theme.border}`,
+        borderTopColor: theme.accent, borderRadius: "50%",
+        animation: "spin 0.8s linear infinite",
+      }}
+    />
+  </div>
+);
+
+const Badge = ({ children, color = theme.accent, bg }) => (
+  <span
+    style={{
+      display: "inline-flex", alignItems: "center", padding: "2px 8px",
+      borderRadius: 4, fontSize: 11, fontWeight: 600, letterSpacing: 0.5,
+      color: color, backgroundColor: bg || `${color}20`,
+      textTransform: "uppercase",
+    }}
+  >
+    {children}
+  </span>
+);
+
+const IconBtn = ({ children, onClick, active, title, style: s }) => (
+  <button
+    onClick={onClick}
+    title={title}
+    style={{
+      background: active ? theme.accentGlow : "transparent",
+      border: `1px solid ${active ? theme.accent : theme.border}`,
+      color: active ? theme.accent : theme.textMuted,
+      borderRadius: 6, padding: "6px 10px", cursor: "pointer",
+      transition: "all 0.15s", fontSize: 13, ...s,
+    }}
+    onMouseEnter={(e) => {
+      if (!active) e.target.style.borderColor = theme.textMuted;
+    }}
+    onMouseLeave={(e) => {
+      if (!active) e.target.style.borderColor = theme.border;
+    }}
+  >
+    {children}
+  </button>
+);
+
+// ─── Safe HTML Email Renderer (sandboxed iframe) ────────────────────────────
+const SafeEmailBody = ({ html, text }) => {
+  const iframeRef = useRef(null);
+  const [iframeHeight, setIframeHeight] = useState(400);
+
+  useEffect(() => {
+    if (!iframeRef.current) return;
+    const checkHeight = () => {
+      try {
+        const doc = iframeRef.current?.contentDocument;
+        if (doc?.body) {
+          const h = doc.body.scrollHeight;
+          if (h > 0) setIframeHeight(Math.min(h + 32, 2000));
+        }
+      } catch (e) {
+        // sandbox may block access
+      }
+    };
+    const timer = setInterval(checkHeight, 500);
+    setTimeout(() => clearInterval(timer), 5000);
+    return () => clearInterval(timer);
+  }, [html, text]);
+
+  if (html) {
+    const wrappedHtml = `
+      <!DOCTYPE html>
+      <html><head>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                 font-size: 14px; line-height: 1.6; color: #1a1a1a; padding: 16px; margin: 0; }
+          img { max-width: 100%; height: auto; }
+          a { color: #3b82f6; }
+          table { max-width: 100%; }
+        </style>
+      </head><body>${html}</body></html>`;
+
+    return (
+      <iframe
+        ref={iframeRef}
+        sandbox="allow-same-origin"
+        srcDoc={wrappedHtml}
+        style={{
+          width: "100%", height: iframeHeight, border: "none",
+          borderRadius: 8, background: "#fff",
+        }}
+        title="Email content"
+      />
+    );
+  }
+
+  return (
+    <pre style={{
+      whiteSpace: "pre-wrap", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      background: "#fff", borderRadius: 8, padding: 20, color: "#1a1a1a",
+      border: `1px solid ${theme.border}`, fontSize: 14, lineHeight: 1.6,
+    }}>
+      {text}
+    </pre>
+  );
+};
+
+// ─── Memoized Email List Item ───────────────────────────────────────────────
+const EmailListItem = memo(({ email, isSelected, onClick, formatDate }) => (
+  <div
+    onClick={() => onClick(email.id)}
+    style={{
+      padding: "12px 20px", borderBottom: `1px solid ${theme.border}`,
+      cursor: "pointer",
+      background: isSelected ? theme.accentGlow
+        : !email.is_read ? `${theme.accent}08` : "transparent",
+      transition: "background 0.15s",
+    }}
+    onMouseEnter={(e) => {
+      if (!isSelected) e.currentTarget.style.background = theme.surfaceHover;
+    }}
+    onMouseLeave={(e) => {
+      if (!isSelected) {
+        e.currentTarget.style.background = !email.is_read ? `${theme.accent}08` : "transparent";
+      }
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+      {!email.is_read && (
+        <div style={{
+          width: 6, height: 6, borderRadius: "50%",
+          background: theme.accent, flexShrink: 0,
+        }} />
+      )}
+      <span style={{
+        fontWeight: email.is_read ? 400 : 600, fontSize: 12,
+        flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+      }}>
+        {email.sender}
+      </span>
+      <span style={{ fontSize: 10, color: theme.textDim, flexShrink: 0 }}>
+        {formatDate(email.received)}
+      </span>
+    </div>
+    <div style={{
+      fontSize: 12, fontWeight: email.is_read ? 400 : 500,
+      color: email.is_read ? theme.textMuted : theme.text,
+      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+      marginBottom: 4,
+    }}>
+      {email.subject || "(No Subject)"}
+    </div>
+    <div style={{
+      fontSize: 11, color: theme.textDim, overflow: "hidden",
+      textOverflow: "ellipsis", whiteSpace: "nowrap",
+    }}>
+      {email.preview}
+    </div>
+    <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+      {email.has_attachments && <Badge color={theme.purple}>📎 Attachment</Badge>}
+      {email.importance === "high" && <Badge color={theme.danger}>❗ High</Badge>}
+      {email.categories?.map((c, i) => <Badge key={i} color={theme.success}>{c}</Badge>)}
+    </div>
+  </div>
+));
+
+// ─── Main App ───────────────────────────────────────────────────────────────
+export default function OutlookScraper() {
+  const [auth, setAuth] = useState({ loading: true, authenticated: false, user: null });
+  const [loginForm, setLoginForm] = useState({ email: "", password: "" });
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats
+  const [folders, setFolders] = useState([]);
+  const [emails, setEmails] = useState([]);
+  const [selectedEmail, setSelectedEmail] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [activeFolder, setActiveFolder] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const debouncedSearch = useDebounce(searchQuery, 300);
+  const [pagination, setPagination] = useState({ skip: 0, top: 25, total: 0 });
+  const [scrapeConfig, setScrapeConfig] = useState({
+    folder_id: "", from_date: "", to_date: "",
+    sender_filter: "", subject_filter: "",
+    max_results: 50, include_attachments: true,
+  });
+  const [scrapeResult, setScrapeResult] = useState(null);
+  const [notification, setNotification] = useState(null);
+
+  const notify = (msg, type = "info") => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 4000);
+  };
+
+  // ─── Auth ───────────────────────────────────────────────────────────────
+  useEffect(() => {
+    checkAuth();
+  }, []);
+
+  // ─── Auto-search on debounced input ────────────────────────────────────
+  useEffect(() => {
+    if (auth.authenticated && debouncedSearch !== undefined) {
+      loadEmails(activeFolder, 0, debouncedSearch);
+    }
+  }, [debouncedSearch]);
+
+  const checkAuth = async () => {
+    try {
+      const res = await fetch(`${API}/auth/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setAuth({ loading: false, ...data });
+      if (data.authenticated) {
+        loadFolders();
+        loadEmails();
+      }
+    } catch (e) {
+      setAuth({ loading: false, authenticated: false, user: null });
+      setError("Cannot connect to backend server");
+    }
+  };
+
+  const login = async (e) => {
+    e.preventDefault();
+    setLoginLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginForm.email, password: loginForm.password }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      await checkAuth();
+    } catch (err) {
+      setError(err.message || "Login failed. Check your credentials.");
+      notify(err.message || "Login failed", "error");
+    }
+    setLoginLoading(false);
+  };
+
+  const logout = async () => {
+    await fetch(`${API}/auth/logout`, { method: "POST" });
+    setAuth({ loading: false, authenticated: false, user: null });
+    setEmails([]);
+    setFolders([]);
+    setSelectedEmail(null);
+    setStats(null);
+  };
+
+  // ─── Data Loading ──────────────────────────────────────────────────────
+  const loadFolders = async () => {
+    try {
+      const res = await fetch(`${API}/api/folders`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setFolders(await res.json());
+    } catch (e) {
+      console.error("Failed to load folders:", e);
+    }
+  };
+
+  const loadEmails = async (folderId = null, skip = 0, search = "") => {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({ skip: String(skip), top: "25" });
+      if (folderId) params.set("folder_id", folderId);
+      if (search) params.set("search", search);
+      const res = await fetch(`${API}/api/emails?${params}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setEmails(data.emails || []);
+      setPagination({ skip, top: 25, total: data.total || 0 });
+    } catch (e) {
+      notify("Failed to load emails", "error");
+      setError("Failed to load emails. Check your connection.");
+    }
+    setLoading(false);
+  };
+
+  const loadEmail = async (id) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API}/api/emails/${id}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSelectedEmail(await res.json());
+      setView("email");
+    } catch (e) {
+      notify("Failed to load email", "error");
+    }
+    setLoading(false);
+  };
+
+  const loadStats = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API}/api/stats`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStats(await res.json());
+    } catch (e) {
+      notify("Failed to load stats", "error");
+    }
+    setLoading(false);
+  };
+
+  const runScrape = async () => {
+    setLoading(true);
+    setScrapeResult(null);
+    setError(null);
+    try {
+      const body = { ...scrapeConfig };
+      Object.keys(body).forEach((k) => {
+        if (body[k] === "" || body[k] === null) delete body[k];
+      });
+      const res = await fetch(`${API}/api/scrape`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setScrapeResult(data);
+      notify(`Scraped ${data.total_scraped} emails`, "success");
+    } catch (e) {
+      notify("Scrape failed", "error");
+    }
+    setLoading(false);
+  };
+
+  const exportData = async (format) => {
+    try {
+      const body = { ...scrapeConfig };
+      Object.keys(body).forEach((k) => {
+        if (body[k] === "" || body[k] === null) delete body[k];
+      });
+      const res = await fetch(`${API}/api/export/${format}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `outlook_export.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+      notify(`Exported as ${format.toUpperCase()}`, "success");
+    } catch (e) {
+      notify("Export failed", "error");
+    }
+  };
+
+  // ─── Folder Click ──────────────────────────────────────────────────────
+  const selectFolder = (f) => {
+    setActiveFolder(f.id);
+    setView("inbox");
+    setSelectedEmail(null);
+    loadEmails(f.id);
+  };
+
+  // ─── Search (form submit for explicit search) ─────────────────────────
+  const handleSearch = (e) => {
+    e.preventDefault();
+    loadEmails(activeFolder, 0, searchQuery);
+  };
+
+  // ─── Helpers ──────────────────────────────────────────────────────────
+  const folderIcon = (name) => {
+    const n = name.toLowerCase();
+    if (n.includes("inbox")) return "📥";
+    if (n.includes("sent")) return "📤";
+    if (n.includes("draft")) return "📝";
+    if (n.includes("delete") || n.includes("trash")) return "🗑️";
+    if (n.includes("junk") || n.includes("spam")) return "⚠️";
+    if (n.includes("archive")) return "📦";
+    return "📁";
+  };
+
+  const formatDate = useCallback((d) => {
+    if (!d) return "";
+    const dt = new Date(d);
+    const now = new Date();
+    const diff = now - dt;
+    if (diff < 86400000) return dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (diff < 604800000) return dt.toLocaleDateString([], { weekday: "short" });
+    return dt.toLocaleDateString([], { month: "short", day: "numeric" });
+  }, []);
+
+  const formatSize = (b) => {
+    if (b < 1024) return `${b} B`;
+    if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+    return `${(b / 1048576).toFixed(1)} MB`;
+  };
+
+  // ─── Login Screen ─────────────────────────────────────────────────────
+  if (auth.loading) return (
+    <div style={{ background: theme.bg, color: theme.text, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <Spinner />
+    </div>
+  );
+
+  if (!auth.authenticated) return (
+    <div style={{
+      background: theme.bg, color: theme.text, minHeight: "100vh",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+    }}>
+      <div style={{
+        textAlign: "center", padding: 48,
+        background: theme.surface, borderRadius: 16,
+        border: `1px solid ${theme.border}`, maxWidth: 440,
+        boxShadow: "0 25px 60px rgba(0,0,0,0.5)",
+      }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>📧</div>
+        <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, letterSpacing: -0.5 }}>
+          Outlook Mail Scraper
+        </h1>
+        <p style={{ color: theme.textMuted, fontSize: 13, marginBottom: 32, lineHeight: 1.6 }}>
+          Connect your Outlook account to browse, search, and export your emails with full metadata and attachments.
+        </p>
+        {error && (
+          <div style={{
+            background: `${theme.danger}15`, border: `1px solid ${theme.danger}40`,
+            borderRadius: 8, padding: "10px 16px", marginBottom: 20,
+            fontSize: 12, color: theme.danger,
+          }}>
+            {error}
+          </div>
+        )}
+        <form onSubmit={login} style={{ textAlign: "left" }}>
+          <label style={{ display: "block", fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>
+            Email
+          </label>
+          <input
+            type="email"
+            required
+            placeholder="you@outlook.com"
+            value={loginForm.email}
+            onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
+            style={{
+              width: "100%", padding: "10px 14px", borderRadius: 8, marginBottom: 16,
+              background: theme.bg, border: `1px solid ${theme.border}`,
+              color: theme.text, fontSize: 13, outline: "none", boxSizing: "border-box",
+            }}
+            onFocus={(e) => e.target.style.borderColor = theme.accent}
+            onBlur={(e) => e.target.style.borderColor = theme.border}
+          />
+          <label style={{ display: "block", fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>
+            App Password
+          </label>
+          <input
+            type="password"
+            required
+            placeholder="xxxx-xxxx-xxxx-xxxx"
+            value={loginForm.password}
+            onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+            style={{
+              width: "100%", padding: "10px 14px", borderRadius: 8, marginBottom: 24,
+              background: theme.bg, border: `1px solid ${theme.border}`,
+              color: theme.text, fontSize: 13, outline: "none", boxSizing: "border-box",
+            }}
+            onFocus={(e) => e.target.style.borderColor = theme.accent}
+            onBlur={(e) => e.target.style.borderColor = theme.border}
+          />
+          <button
+            type="submit"
+            disabled={loginLoading}
+            style={{
+              width: "100%", background: theme.accent, color: "#fff", border: "none",
+              padding: "12px 32px", borderRadius: 8, fontSize: 14,
+              fontWeight: 600, cursor: loginLoading ? "not-allowed" : "pointer",
+              letterSpacing: 0.3, transition: "all 0.2s",
+              boxShadow: `0 4px 20px ${theme.accentGlow}`,
+              opacity: loginLoading ? 0.6 : 1,
+            }}
+          >
+            {loginLoading ? "Connecting..." : "Sign In"}
+          </button>
+        </form>
+        <div style={{ marginTop: 20, fontSize: 11, color: theme.textDim, lineHeight: 1.6 }}>
+          Works with Outlook.com, Hotmail, and Microsoft 365 accounts
+          <br />
+          <a href="https://account.microsoft.com/security" target="_blank" rel="noopener noreferrer"
+            style={{ color: theme.accent, textDecoration: "none" }}>
+            Generate an app password
+          </a>{" "}
+          · Data stays on your server
+        </div>
+      </div>
+    </div>
+  );
+
+  // ─── Main Dashboard ───────────────────────────────────────────────────
+  return (
+    <div style={{
+      display: "flex", height: "100vh", overflow: "hidden",
+      background: theme.bg, color: theme.text,
+      fontFamily: "'JetBrains Mono', 'SF Mono', 'Fira Code', monospace",
+      fontSize: 13,
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes slideIn { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: ${theme.border}; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: ${theme.textDim}; }
+        input, select { font-family: inherit; }
+      `}</style>
+
+      {/* ─── Notification ─────────────────────────────────────────────── */}
+      {notification && (
+        <div style={{
+          position: "fixed", top: 16, right: 16, zIndex: 1000,
+          padding: "10px 20px", borderRadius: 8, fontSize: 12, fontWeight: 500,
+          animation: "slideIn 0.3s ease",
+          background: notification.type === "error" ? theme.danger
+            : notification.type === "success" ? theme.success : theme.accent,
+          color: "#fff", boxShadow: "0 8px 30px rgba(0,0,0,0.4)",
+        }}>
+          {notification.msg}
+        </div>
+      )}
+
+      {/* ─── Sidebar ──────────────────────────────────────────────────── */}
+      <aside style={{
+        width: sidebarOpen ? 240 : 56, flexShrink: 0,
+        background: theme.surface, borderRight: `1px solid ${theme.border}`,
+        display: "flex", flexDirection: "column", transition: "width 0.2s",
+        overflow: "hidden",
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: sidebarOpen ? "16px 16px 12px" : "16px 8px 12px",
+          borderBottom: `1px solid ${theme.border}`,
+          display: "flex", alignItems: "center", gap: 10,
+        }}>
+          <button
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            style={{
+              background: "none", border: "none", color: theme.textMuted,
+              cursor: "pointer", fontSize: 18, padding: 4, flexShrink: 0,
+            }}
+          >
+            {sidebarOpen ? "◀" : "▶"}
+          </button>
+          {sidebarOpen && (
+            <span style={{ fontWeight: 700, fontSize: 14, letterSpacing: -0.5, whiteSpace: "nowrap" }}>
+              📧 Mail Scraper
+            </span>
+          )}
+        </div>
+
+        {/* User Info */}
+        {sidebarOpen && auth.user && (
+          <div style={{ padding: "12px 16px", borderBottom: `1px solid ${theme.border}` }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: theme.text, marginBottom: 2 }}>
+              {auth.user.name}
+            </div>
+            <div style={{ fontSize: 10, color: theme.textDim, wordBreak: "break-all" }}>
+              {auth.user.email}
+            </div>
+          </div>
+        )}
+
+        {/* Nav */}
+        <nav style={{ padding: "8px", flex: 1, overflowY: "auto" }}>
+          {[
+            { id: "inbox", icon: "📥", label: "All Mail", action: () => { setView("inbox"); setActiveFolder(null); setSelectedEmail(null); loadEmails(); } },
+            { id: "scrape", icon: "🔍", label: "Scrape & Export", action: () => { setView("scrape"); setSelectedEmail(null); } },
+            { id: "stats", icon: "📊", label: "Statistics", action: () => { setView("stats"); setSelectedEmail(null); loadStats(); } },
+          ].map((item) => (
+            <button
+              key={item.id}
+              onClick={item.action}
+              style={{
+                display: "flex", alignItems: "center", gap: 10, width: "100%",
+                padding: sidebarOpen ? "8px 12px" : "8px", borderRadius: 6,
+                background: view === item.id && !activeFolder ? theme.accentGlow : "transparent",
+                border: "none", color: view === item.id && !activeFolder ? theme.accent : theme.textMuted,
+                cursor: "pointer", fontSize: 12, fontWeight: 500, textAlign: "left",
+                transition: "all 0.15s", justifyContent: sidebarOpen ? "flex-start" : "center",
+              }}
+            >
+              <span style={{ fontSize: 15, flexShrink: 0 }}>{item.icon}</span>
+              {sidebarOpen && item.label}
+            </button>
+          ))}
+
+          {sidebarOpen && (
+            <>
+              <div style={{
+                fontSize: 10, fontWeight: 600, color: theme.textDim, padding: "16px 12px 6px",
+                letterSpacing: 1, textTransform: "uppercase",
+              }}>
+                Folders
+              </div>
+              {folders.map((f) => (
+                <button
+                  key={f.id}
+                  onClick={() => selectFolder(f)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8, width: "100%",
+                    padding: "6px 12px", borderRadius: 6,
+                    background: activeFolder === f.id ? theme.accentGlow : "transparent",
+                    border: "none", color: activeFolder === f.id ? theme.accent : theme.textMuted,
+                    cursor: "pointer", fontSize: 12, textAlign: "left",
+                    transition: "all 0.15s",
+                  }}
+                >
+                  <span style={{ fontSize: 13 }}>{folderIcon(f.name)}</span>
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {f.name}
+                  </span>
+                  {f.unread_count > 0 && (
+                    <span style={{
+                      background: theme.accent, color: "#fff", fontSize: 10,
+                      padding: "1px 6px", borderRadius: 10, fontWeight: 600,
+                    }}>
+                      {f.unread_count}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </>
+          )}
+        </nav>
+
+        {/* Logout */}
+        <div style={{ padding: 8, borderTop: `1px solid ${theme.border}` }}>
+          <button
+            onClick={logout}
+            style={{
+              width: "100%", padding: "8px", borderRadius: 6,
+              background: "transparent", border: `1px solid ${theme.border}`,
+              color: theme.textMuted, cursor: "pointer", fontSize: 11,
+            }}
+          >
+            {sidebarOpen ? "Sign Out" : "⏻"}
+          </button>
+        </div>
+      </aside>
+
+      {/* ─── Main Content ─────────────────────────────────────────────── */}
+      <main style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
+        {/* ─── Error Banner ───────────────────────────────────────────── */}
+        {error && (
+          <div style={{
+            padding: "10px 20px", background: `${theme.danger}15`,
+            borderBottom: `1px solid ${theme.danger}40`,
+            fontSize: 12, color: theme.danger, display: "flex",
+            justifyContent: "space-between", alignItems: "center",
+          }}>
+            <span>{error}</span>
+            <button
+              onClick={() => setError(null)}
+              style={{ background: "none", border: "none", color: theme.danger, cursor: "pointer", fontSize: 14 }}
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* ─── Inbox View ─────────────────────────────────────────────── */}
+        {(view === "inbox" || view === "email") && (
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            {/* Search Bar */}
+            <div style={{
+              padding: "12px 20px", borderBottom: `1px solid ${theme.border}`,
+              display: "flex", alignItems: "center", gap: 12,
+            }}>
+              <form onSubmit={handleSearch} style={{ flex: 1, display: "flex", gap: 8 }}>
+                <input
+                  type="text"
+                  placeholder="Search emails... (auto-searches as you type)"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  style={{
+                    flex: 1, padding: "8px 14px", borderRadius: 6,
+                    background: theme.bg, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12, outline: "none",
+                  }}
+                  onFocus={(e) => e.target.style.borderColor = theme.accent}
+                  onBlur={(e) => e.target.style.borderColor = theme.border}
+                />
+                <IconBtn type="submit" onClick={handleSearch}>Search</IconBtn>
+              </form>
+              <IconBtn onClick={() => loadEmails(activeFolder, pagination.skip, searchQuery)}>↻ Refresh</IconBtn>
+            </div>
+
+            <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+              {/* Email List */}
+              <div style={{
+                width: view === "email" ? 360 : "100%",
+                borderRight: view === "email" ? `1px solid ${theme.border}` : "none",
+                overflowY: "auto", transition: "width 0.2s",
+              }}>
+                {loading && !emails.length ? <Spinner /> : emails.length === 0 ? (
+                  <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                    {searchQuery ? "No emails match your search." : "No emails found."}
+                  </div>
+                ) : emails.map((email) => (
+                  <EmailListItem
+                    key={email.id}
+                    email={email}
+                    isSelected={selectedEmail?.id === email.id}
+                    onClick={loadEmail}
+                    formatDate={formatDate}
+                  />
+                ))}
+
+                {/* Pagination */}
+                {emails.length > 0 && (
+                  <div style={{
+                    padding: "12px 20px", display: "flex", alignItems: "center",
+                    justifyContent: "space-between", borderTop: `1px solid ${theme.border}`,
+                  }}>
+                    <span style={{ fontSize: 11, color: theme.textDim }}>
+                      {pagination.skip + 1}–{Math.min(pagination.skip + pagination.top, pagination.total)} of {pagination.total}
+                    </span>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <IconBtn
+                        onClick={() => {
+                          if (pagination.skip > 0) loadEmails(activeFolder, Math.max(0, pagination.skip - 25), searchQuery);
+                        }}
+                        style={{ opacity: pagination.skip === 0 ? 0.3 : 1, pointerEvents: pagination.skip === 0 ? "none" : "auto" }}
+                      >
+                        ← Prev
+                      </IconBtn>
+                      <IconBtn
+                        onClick={() => {
+                          if (pagination.skip + 25 < pagination.total) loadEmails(activeFolder, pagination.skip + 25, searchQuery);
+                        }}
+                        style={{ opacity: pagination.skip + 25 >= pagination.total ? 0.3 : 1, pointerEvents: pagination.skip + 25 >= pagination.total ? "none" : "auto" }}
+                      >
+                        Next →
+                      </IconBtn>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Email Detail Panel */}
+              {view === "email" && selectedEmail && (
+                <div style={{ flex: 1, overflowY: "auto", animation: "fadeIn 0.2s ease" }}>
+                  <div style={{ padding: 24 }}>
+                    {/* Close button */}
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
+                      <IconBtn onClick={() => { setView("inbox"); setSelectedEmail(null); }}>← Back to list</IconBtn>
+                    </div>
+
+                    {/* Subject */}
+                    <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, letterSpacing: -0.5, lineHeight: 1.3 }}>
+                      {selectedEmail.subject}
+                    </h2>
+
+                    {/* Metadata */}
+                    <div style={{
+                      background: theme.surface, borderRadius: 8, padding: 16,
+                      border: `1px solid ${theme.border}`, marginBottom: 20,
+                    }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "80px 1fr", gap: "8px 12px", fontSize: 12 }}>
+                        <span style={{ color: theme.textDim, fontWeight: 500 }}>From</span>
+                        <span>{selectedEmail.sender.name} &lt;{selectedEmail.sender.email}&gt;</span>
+
+                        <span style={{ color: theme.textDim, fontWeight: 500 }}>To</span>
+                        <span>{selectedEmail.to_recipients.map((r) => `${r.name} <${r.email}>`).join(", ")}</span>
+
+                        {selectedEmail.cc_recipients.length > 0 && (
+                          <>
+                            <span style={{ color: theme.textDim, fontWeight: 500 }}>CC</span>
+                            <span>{selectedEmail.cc_recipients.map((r) => `${r.name} <${r.email}>`).join(", ")}</span>
+                          </>
+                        )}
+
+                        <span style={{ color: theme.textDim, fontWeight: 500 }}>Date</span>
+                        <span>{new Date(selectedEmail.received).toLocaleString()}</span>
+
+                        <span style={{ color: theme.textDim, fontWeight: 500 }}>Msg ID</span>
+                        <span style={{ wordBreak: "break-all", color: theme.textDim, fontSize: 10 }}>
+                          {selectedEmail.internet_message_id}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Attachments */}
+                    {selectedEmail.attachments.length > 0 && (
+                      <div style={{
+                        background: theme.surface, borderRadius: 8, padding: 16,
+                        border: `1px solid ${theme.border}`, marginBottom: 20,
+                      }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, color: theme.textDim, marginBottom: 10, textTransform: "uppercase", letterSpacing: 1 }}>
+                          📎 Attachments ({selectedEmail.attachments.length})
+                        </div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                          {selectedEmail.attachments.map((att) => (
+                            <a
+                              key={att.id}
+                              href={`${API}/api/emails/${selectedEmail.id}/attachments/${att.id}`}
+                              style={{
+                                display: "flex", alignItems: "center", gap: 8,
+                                padding: "8px 12px", borderRadius: 6,
+                                background: theme.bg, border: `1px solid ${theme.border}`,
+                                color: theme.text, textDecoration: "none", fontSize: 11,
+                                transition: "border-color 0.15s",
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.borderColor = theme.accent}
+                              onMouseLeave={(e) => e.currentTarget.style.borderColor = theme.border}
+                            >
+                              <span>📄</span>
+                              <div>
+                                <div style={{ fontWeight: 500 }}>{att.name}</div>
+                                <div style={{ fontSize: 10, color: theme.textDim }}>{formatSize(att.size)}</div>
+                              </div>
+                            </a>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Headers (collapsible) */}
+                    {selectedEmail.headers.length > 0 && (
+                      <details style={{ marginBottom: 20 }}>
+                        <summary style={{
+                          fontSize: 11, fontWeight: 600, color: theme.textDim,
+                          cursor: "pointer", textTransform: "uppercase", letterSpacing: 1,
+                          marginBottom: 8,
+                        }}>
+                          View Email Headers ({selectedEmail.headers.length})
+                        </summary>
+                        <div style={{
+                          background: theme.surface, borderRadius: 8, padding: 12,
+                          border: `1px solid ${theme.border}`, maxHeight: 300,
+                          overflowY: "auto", fontSize: 10, lineHeight: 1.6,
+                        }}>
+                          {selectedEmail.headers.map((h, i) => (
+                            <div key={i} style={{ marginBottom: 4 }}>
+                              <span style={{ color: theme.accent, fontWeight: 600 }}>{h.name}:</span>{" "}
+                              <span style={{ color: theme.textMuted, wordBreak: "break-all" }}>{h.value}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+
+                    {/* Email Body — rendered safely in sandboxed iframe */}
+                    <SafeEmailBody html={selectedEmail.body_html} text={selectedEmail.body_text} />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ─── Scrape & Export View ───────────────────────────────────── */}
+        {view === "scrape" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
+              🔍 Scrape & Export
+            </h2>
+            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 24 }}>
+              Configure filters to bulk-scrape emails with all metadata and attachments.
+            </p>
+
+            <div style={{
+              display: "grid", gridTemplateColumns: "1fr 1fr",
+              gap: 16, maxWidth: 700, marginBottom: 24,
+            }}>
+              {/* Folder */}
+              <div>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  Folder
+                </label>
+                <select
+                  value={scrapeConfig.folder_id}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, folder_id: e.target.value })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                >
+                  <option value="">All Folders</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>{f.name} ({f.total_count})</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Max Results */}
+              <div>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  Max Results
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  max="500"
+                  value={scrapeConfig.max_results}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, max_results: Math.min(500, Math.max(1, parseInt(e.target.value) || 50)) })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                />
+              </div>
+
+              {/* From Date */}
+              <div>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  From Date
+                </label>
+                <input
+                  type="date"
+                  value={scrapeConfig.from_date}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, from_date: e.target.value })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                />
+              </div>
+
+              {/* To Date */}
+              <div>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  To Date
+                </label>
+                <input
+                  type="date"
+                  value={scrapeConfig.to_date}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, to_date: e.target.value })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                />
+              </div>
+
+              {/* Sender Filter */}
+              <div>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  Sender Email
+                </label>
+                <input
+                  type="email"
+                  placeholder="sender@example.com"
+                  value={scrapeConfig.sender_filter}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, sender_filter: e.target.value })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                />
+              </div>
+
+              {/* Subject Filter */}
+              <div>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  Subject Contains
+                </label>
+                <input
+                  type="text"
+                  placeholder="keyword..."
+                  value={scrapeConfig.subject_filter}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, subject_filter: e.target.value })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Include Attachments Toggle */}
+            <label style={{
+              display: "flex", alignItems: "center", gap: 10,
+              fontSize: 12, color: theme.textMuted, marginBottom: 24, cursor: "pointer",
+            }}>
+              <input
+                type="checkbox"
+                checked={scrapeConfig.include_attachments}
+                onChange={(e) => setScrapeConfig({ ...scrapeConfig, include_attachments: e.target.checked })}
+                style={{ accentColor: theme.accent }}
+              />
+              Download and save all attachments
+            </label>
+
+            {/* Action Buttons */}
+            <div style={{ display: "flex", gap: 10, marginBottom: 32 }}>
+              <button
+                onClick={runScrape}
+                disabled={loading}
+                style={{
+                  padding: "10px 24px", borderRadius: 8, border: "none",
+                  background: theme.accent, color: "#fff", fontSize: 13,
+                  fontWeight: 600, cursor: loading ? "not-allowed" : "pointer",
+                  boxShadow: `0 4px 16px ${theme.accentGlow}`,
+                  opacity: loading ? 0.6 : 1,
+                }}
+              >
+                {loading ? "Scraping..." : "🚀 Start Scrape"}
+              </button>
+              <IconBtn onClick={() => exportData("json")}>Export JSON</IconBtn>
+              <IconBtn onClick={() => exportData("csv")}>Export CSV</IconBtn>
+            </div>
+
+            {/* Scrape Results */}
+            {loading && <Spinner />}
+            {scrapeResult && (
+              <div style={{
+                background: theme.surface, borderRadius: 8, padding: 20,
+                border: `1px solid ${theme.border}`,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+                  <Badge color={theme.success}>✓ Complete</Badge>
+                  <span style={{ fontSize: 12, color: theme.textMuted }}>
+                    Scraped {scrapeResult.total_scraped} emails at {new Date(scrapeResult.exported_at).toLocaleString()}
+                  </span>
+                </div>
+
+                {/* Preview table */}
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                    <thead>
+                      <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
+                        {["Subject", "From", "Date", "Attachments"].map((h) => (
+                          <th key={h} style={{
+                            padding: "8px 12px", textAlign: "left",
+                            color: theme.textDim, fontWeight: 600,
+                            textTransform: "uppercase", letterSpacing: 0.5, fontSize: 10,
+                          }}>
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {scrapeResult.emails.slice(0, 20).map((e, i) => (
+                        <tr key={i} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                          <td style={{ padding: "8px 12px", maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {e.subject}
+                          </td>
+                          <td style={{ padding: "8px 12px", color: theme.textMuted }}>{e.sender_name}</td>
+                          <td style={{ padding: "8px 12px", color: theme.textDim }}>{formatDate(e.received)}</td>
+                          <td style={{ padding: "8px 12px" }}>
+                            {e.attachments?.length > 0 && (
+                              <Badge color={theme.purple}>{e.attachments.length} file(s)</Badge>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {scrapeResult.total_scraped > 20 && (
+                  <div style={{ padding: "12px", fontSize: 11, color: theme.textDim, textAlign: "center" }}>
+                    Showing 20 of {scrapeResult.total_scraped} results. Export for full data.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ─── Stats View ─────────────────────────────────────────────── */}
+        {view === "stats" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 24, letterSpacing: -0.5 }}>
+              📊 Mailbox Statistics
+            </h2>
+
+            {loading ? <Spinner /> : stats ? (
+              <>
+                {/* Stat Cards */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+                  {[
+                    { label: "Total Emails", value: stats.total_emails?.toLocaleString(), color: theme.accent },
+                    { label: "Unread", value: stats.total_unread?.toLocaleString(), color: theme.warning },
+                    { label: "Last 7 Days", value: stats.emails_last_7_days?.toLocaleString(), color: theme.success },
+                  ].map((s) => (
+                    <div key={s.label} style={{
+                      background: theme.surface, borderRadius: 10, padding: 20,
+                      border: `1px solid ${theme.border}`,
+                    }}>
+                      <div style={{ fontSize: 10, color: theme.textDim, textTransform: "uppercase", letterSpacing: 1, fontWeight: 600, marginBottom: 8 }}>
+                        {s.label}
+                      </div>
+                      <div style={{ fontSize: 28, fontWeight: 700, color: s.color, letterSpacing: -1 }}>
+                        {s.value}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                  {/* Folder Breakdown */}
+                  <div style={{
+                    background: theme.surface, borderRadius: 10, padding: 20,
+                    border: `1px solid ${theme.border}`,
+                  }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: theme.textDim, marginBottom: 16, textTransform: "uppercase", letterSpacing: 1 }}>
+                      Folder Breakdown
+                    </div>
+                    {stats.folder_stats?.map((f) => (
+                      <div key={f.name} style={{
+                        display: "flex", justifyContent: "space-between", alignItems: "center",
+                        padding: "8px 0", borderBottom: `1px solid ${theme.border}`,
+                      }}>
+                        <span style={{ fontSize: 12 }}>
+                          {folderIcon(f.name)} {f.name}
+                        </span>
+                        <div style={{ display: "flex", gap: 12, fontSize: 11 }}>
+                          <span style={{ color: theme.textMuted }}>{f.total.toLocaleString()}</span>
+                          {f.unread > 0 && <Badge color={theme.warning}>{f.unread} unread</Badge>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Top Senders */}
+                  <div style={{
+                    background: theme.surface, borderRadius: 10, padding: 20,
+                    border: `1px solid ${theme.border}`,
+                  }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: theme.textDim, marginBottom: 16, textTransform: "uppercase", letterSpacing: 1 }}>
+                      Top Senders (Recent)
+                    </div>
+                    {stats.top_senders?.map((s, i) => {
+                      const maxCount = stats.top_senders[0]?.count || 1;
+                      return (
+                        <div key={s.email} style={{ marginBottom: 12 }}>
+                          <div style={{
+                            display: "flex", justifyContent: "space-between",
+                            fontSize: 12, marginBottom: 4,
+                          }}>
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+                              {s.name}
+                            </span>
+                            <span style={{ color: theme.accent, fontWeight: 600, flexShrink: 0, marginLeft: 8 }}>
+                              {s.count}
+                            </span>
+                          </div>
+                          <div style={{
+                            height: 4, borderRadius: 2, background: theme.bg,
+                          }}>
+                            <div style={{
+                              height: "100%", borderRadius: 2,
+                              width: `${(s.count / maxCount) * 100}%`,
+                              background: `linear-gradient(90deg, ${theme.accent}, ${theme.purple})`,
+                              transition: "width 0.5s ease",
+                            }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div style={{ padding: 40, textAlign: "center", color: theme.textDim }}>
+                No statistics available. Try refreshing.
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

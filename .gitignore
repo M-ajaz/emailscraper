@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# Environment and secrets
+.env
+!.env.example
+
+# App-specific
+token_cache.json
+attachments/
+
+# OS
+.DS_Store
+Thumbs.db
