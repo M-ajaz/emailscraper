@@ -11,6 +11,7 @@ import re
 import base64
 import logging
 import time
+import mimetypes
 import imaplib
 import email
 import email.header
@@ -38,6 +39,62 @@ IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 
 ATTACHMENTS_DIR = Path("./attachments")
 ATTACHMENTS_DIR.mkdir(exist_ok=True)
+_METADATA_FILE = ATTACHMENTS_DIR / "_metadata.json"
+
+IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "image/bmp"}
+PDF_TYPES = {"application/pdf"}
+DOC_TYPES = {
+    "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/plain", "text/csv",
+}
+
+
+def _read_attachment_metadata() -> dict:
+    if _METADATA_FILE.exists():
+        try:
+            return json.loads(_METADATA_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _write_attachment_metadata(metadata: dict) -> None:
+    _METADATA_FILE.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+
+def _save_attachment_with_metadata(
+    content: bytes, uid: int, index: int, original_name: str, content_type: str,
+    email_subject: str = "", email_sender: str = "", email_date: str = "",
+) -> str:
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", original_name)
+    filename = f"{uid}_{index}_{safe_name}"
+    filepath = ATTACHMENTS_DIR / filename
+    filepath.write_bytes(content)
+    metadata = _read_attachment_metadata()
+    metadata[filename] = {
+        "original_name": original_name,
+        "content_type": content_type,
+        "size": len(content),
+        "email_subject": email_subject,
+        "email_sender": email_sender,
+        "email_date": email_date,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_attachment_metadata(metadata)
+    return filename
+
+
+def _classify_file_type(content_type: str) -> str:
+    if content_type in IMAGE_TYPES:
+        return "image"
+    if content_type in PDF_TYPES:
+        return "pdf"
+    if content_type in DOC_TYPES:
+        return "document"
+    return "other"
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -495,6 +552,23 @@ class ScrapedAttachmentInfo(BaseModel):
     size: int = 0
     is_inline: bool = False
     saved_path: Optional[str] = None
+    filename: Optional[str] = None
+    download_url: Optional[str] = None
+    preview_url: Optional[str] = None
+
+
+class StoredAttachmentInfo(BaseModel):
+    filename: str
+    original_name: str = ""
+    content_type: str = ""
+    file_type: str = "other"
+    size: int = 0
+    email_subject: str = ""
+    email_sender: str = ""
+    email_date: str = ""
+    saved_at: str = ""
+    download_url: str = ""
+    preview_url: str = ""
 
 
 class ScrapedEmailData(BaseModel):
@@ -873,6 +947,91 @@ async def download_attachment(email_id: str, attachment_id: str):
     )
 
 
+# ─── Stored Attachment Endpoints ─────────────────────────────────────────────
+
+def _validate_attachment_filename(filename: str) -> Path:
+    """Validate filename to prevent path traversal, return resolved path."""
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    filepath = ATTACHMENTS_DIR / filename
+    if not filepath.exists() or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return filepath
+
+
+@app.get("/api/attachments", response_model=List[StoredAttachmentInfo])
+async def list_stored_attachments(file_type: Optional[str] = None):
+    """List all stored attachments with metadata."""
+    metadata = _read_attachment_metadata()
+    results = []
+    for filename, meta in metadata.items():
+        filepath = ATTACHMENTS_DIR / filename
+        if not filepath.exists():
+            continue
+        ct = meta.get("content_type", "")
+        ft = _classify_file_type(ct)
+        if file_type and ft != file_type:
+            continue
+        results.append(StoredAttachmentInfo(
+            filename=filename,
+            original_name=meta.get("original_name", filename),
+            content_type=ct,
+            file_type=ft,
+            size=meta.get("size", 0),
+            email_subject=meta.get("email_subject", ""),
+            email_sender=meta.get("email_sender", ""),
+            email_date=meta.get("email_date", ""),
+            saved_at=meta.get("saved_at", ""),
+            download_url=f"/api/attachments/{filename}",
+            preview_url=f"/api/attachments/{filename}/preview",
+        ))
+    results.sort(key=lambda a: a.saved_at, reverse=True)
+    return results
+
+
+@app.get("/api/attachments/{filename}")
+async def serve_attachment(filename: str):
+    """Download a stored attachment."""
+    filepath = _validate_attachment_filename(filename)
+    content = filepath.read_bytes()
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    metadata = _read_attachment_metadata()
+    original_name = metadata.get(filename, {}).get("original_name", filename)
+    return Response(
+        content=content, media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{original_name}"'},
+    )
+
+
+@app.get("/api/attachments/{filename}/preview")
+async def preview_attachment(filename: str):
+    """Preview a stored attachment. Images/PDFs served inline; others return metadata."""
+    filepath = _validate_attachment_filename(filename)
+    metadata = _read_attachment_metadata()
+    meta = metadata.get(filename, {})
+    content_type = meta.get("content_type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+
+    if content_type in IMAGE_TYPES or content_type in PDF_TYPES:
+        content = filepath.read_bytes()
+        return Response(
+            content=content, media_type=content_type,
+            headers={"Content-Disposition": f'inline; filename="{meta.get("original_name", filename)}"'},
+        )
+
+    return {
+        "filename": filename,
+        "original_name": meta.get("original_name", filename),
+        "content_type": content_type,
+        "file_type": _classify_file_type(content_type),
+        "size": meta.get("size", 0),
+        "email_subject": meta.get("email_subject", ""),
+        "email_sender": meta.get("email_sender", ""),
+        "email_date": meta.get("email_date", ""),
+        "download_url": f"/api/attachments/{filename}",
+        "preview_available": False,
+    }
+
+
 # ─── Scrape & Export ────────────────────────────────────────────────────────
 
 def _scrape_impl(
@@ -930,10 +1089,16 @@ def _scrape_impl(
                     )
                     result = _get_attachment_by_index(msg, a["index"])
                     if result:
-                        safe_name = a["name"].replace("/", "_").replace("\\", "_")
-                        att_path = ATTACHMENTS_DIR / f"{parsed_uid}_{safe_name}"
-                        att_path.write_bytes(result[2])
-                        att_info.saved_path = str(att_path)
+                        saved_filename = _save_attachment_with_metadata(
+                            content=result[2], uid=parsed_uid, index=a["index"],
+                            original_name=a["name"], content_type=a["content_type"],
+                            email_subject=subject, email_sender=from_addr,
+                            email_date=date_str,
+                        )
+                        att_info.saved_path = str(ATTACHMENTS_DIR / saved_filename)
+                        att_info.filename = saved_filename
+                        att_info.download_url = f"/api/attachments/{saved_filename}"
+                        att_info.preview_url = f"/api/attachments/{saved_filename}/preview"
                     scraped_atts.append(att_info)
             else:
                 scraped_atts = [

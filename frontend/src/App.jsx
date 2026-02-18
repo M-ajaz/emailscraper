@@ -204,7 +204,7 @@ export default function OutlookScraper() {
   const [auth, setAuth] = useState({ loading: true, authenticated: false, user: null });
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [loginLoading, setLoginLoading] = useState(false);
-  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats
+  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments
   const [folders, setFolders] = useState([]);
   const [emails, setEmails] = useState([]);
   const [selectedEmail, setSelectedEmail] = useState(null);
@@ -224,6 +224,9 @@ export default function OutlookScraper() {
     max_results: 50, include_attachments: true,
   });
   const [scrapeResult, setScrapeResult] = useState(null);
+  const [storedAttachments, setStoredAttachments] = useState([]);
+  const [attachmentFilter, setAttachmentFilter] = useState("all");
+  const [previewModal, setPreviewModal] = useState(null);
   const [notification, setNotification] = useState(null);
 
   const notify = (msg, type = "info") => {
@@ -350,6 +353,20 @@ export default function OutlookScraper() {
     setLoading(false);
   };
 
+  const loadAttachments = async (typeFilter) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (typeFilter && typeFilter !== "all") params.set("file_type", typeFilter);
+      const res = await fetch(`${API}/api/attachments?${params}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStoredAttachments(await res.json());
+    } catch (e) {
+      notify("Failed to load attachments", "error");
+    }
+    setLoading(false);
+  };
+
   const runScrape = async () => {
     setLoading(true);
     setScrapeResult(null);
@@ -439,6 +456,25 @@ export default function OutlookScraper() {
     if (b < 1024) return `${b} B`;
     if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
     return `${(b / 1048576).toFixed(1)} MB`;
+  };
+
+  const fileTypeIcon = (ct) => {
+    if (!ct) return "📄";
+    if (ct.startsWith("image/")) return "🖼️";
+    if (ct === "application/pdf") return "📕";
+    if (ct.includes("word") || ct.includes("document")) return "📘";
+    if (ct.includes("sheet") || ct.includes("excel")) return "📗";
+    if (ct.includes("presentation") || ct.includes("powerpoint")) return "📙";
+    if (ct.startsWith("text/")) return "📝";
+    if (ct.startsWith("video/")) return "🎬";
+    if (ct.startsWith("audio/")) return "🎵";
+    if (ct.includes("zip") || ct.includes("rar") || ct.includes("tar")) return "📦";
+    return "📄";
+  };
+
+  const isPreviewable = (ct) => {
+    if (!ct) return false;
+    return ct.startsWith("image/") || ct === "application/pdf";
   };
 
   // ─── Login Screen ─────────────────────────────────────────────────────
@@ -620,6 +656,7 @@ export default function OutlookScraper() {
           {[
             { id: "inbox", icon: "📥", label: "All Mail", action: () => { setView("inbox"); setActiveFolder(null); setSelectedEmail(null); loadEmails(null, 0, searchQuery, inboxFilters); } },
             { id: "scrape", icon: "🔍", label: "Scrape & Export", action: () => { setView("scrape"); setSelectedEmail(null); } },
+            { id: "attachments", icon: "📎", label: "Attachments", badge: storedAttachments.length || null, action: () => { setView("attachments"); setSelectedEmail(null); loadAttachments(attachmentFilter); } },
             { id: "stats", icon: "📊", label: "Statistics", action: () => { setView("stats"); setSelectedEmail(null); loadStats(); } },
           ].map((item) => (
             <button
@@ -636,6 +673,14 @@ export default function OutlookScraper() {
             >
               <span style={{ fontSize: 15, flexShrink: 0 }}>{item.icon}</span>
               {sidebarOpen && item.label}
+              {sidebarOpen && item.badge > 0 && (
+                <span style={{
+                  background: theme.purple, color: "#fff", fontSize: 9,
+                  padding: "1px 5px", borderRadius: 8, fontWeight: 600, marginLeft: "auto",
+                }}>
+                  {item.badge}
+                </span>
+              )}
             </button>
           ))}
 
@@ -939,28 +984,82 @@ export default function OutlookScraper() {
                         <div style={{ fontSize: 11, fontWeight: 600, color: theme.textDim, marginBottom: 10, textTransform: "uppercase", letterSpacing: 1 }}>
                           📎 Attachments ({selectedEmail.attachments.length})
                         </div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                          {selectedEmail.attachments.map((att) => (
-                            <a
-                              key={att.id}
-                              href={`${API}/api/emails/${selectedEmail.id}/attachments/${att.id}`}
-                              style={{
-                                display: "flex", alignItems: "center", gap: 8,
-                                padding: "8px 12px", borderRadius: 6,
-                                background: theme.bg, border: `1px solid ${theme.border}`,
-                                color: theme.text, textDecoration: "none", fontSize: 11,
-                                transition: "border-color 0.15s",
-                              }}
-                              onMouseEnter={(e) => e.currentTarget.style.borderColor = theme.accent}
-                              onMouseLeave={(e) => e.currentTarget.style.borderColor = theme.border}
-                            >
-                              <span>📄</span>
-                              <div>
-                                <div style={{ fontWeight: 500 }}>{att.name}</div>
-                                <div style={{ fontSize: 10, color: theme.textDim }}>{formatSize(att.size)}</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                          {selectedEmail.attachments.map((att) => {
+                            const ct = att.content_type || "";
+                            const isImage = ct.startsWith("image/");
+                            const isPdf = ct === "application/pdf";
+                            const downloadHref = `${API}/api/emails/${selectedEmail.id}/attachments/${att.id}`;
+                            return (
+                              <div
+                                key={att.id}
+                                style={{
+                                  borderRadius: 6, background: theme.bg,
+                                  border: `1px solid ${theme.border}`,
+                                  overflow: "hidden", cursor: isImage || isPdf ? "pointer" : "default",
+                                  transition: "border-color 0.15s", width: isImage ? 160 : "auto",
+                                }}
+                                onClick={() => {
+                                  if (isImage || isPdf) {
+                                    setPreviewModal({
+                                      filename: att.name,
+                                      original_name: att.name,
+                                      content_type: ct,
+                                      size: att.size,
+                                      email_subject: selectedEmail.subject,
+                                      preview_url: `/api/emails/${selectedEmail.id}/attachments/${att.id}`,
+                                      download_url: `/api/emails/${selectedEmail.id}/attachments/${att.id}`,
+                                    });
+                                  }
+                                }}
+                                onMouseEnter={(e) => e.currentTarget.style.borderColor = theme.accent}
+                                onMouseLeave={(e) => e.currentTarget.style.borderColor = theme.border}
+                              >
+                                {/* Inline image preview */}
+                                {isImage && (
+                                  <div style={{
+                                    width: "100%", height: 100, overflow: "hidden",
+                                    display: "flex", alignItems: "center", justifyContent: "center",
+                                    background: "#fff",
+                                  }}>
+                                    <img
+                                      src={downloadHref}
+                                      alt={att.name}
+                                      style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+                                      loading="lazy"
+                                    />
+                                  </div>
+                                )}
+                                {/* PDF mini indicator */}
+                                {isPdf && (
+                                  <div style={{
+                                    padding: "8px 12px", display: "flex", alignItems: "center", gap: 6,
+                                    background: `${theme.danger}10`,
+                                  }}>
+                                    <span style={{ fontSize: 16 }}>📕</span>
+                                    <span style={{ fontSize: 10, color: theme.danger, fontWeight: 600 }}>View PDF</span>
+                                  </div>
+                                )}
+                                <div style={{ padding: "8px 12px", display: "flex", alignItems: "center", gap: 8 }}>
+                                  {!isImage && !isPdf && <span>{fileTypeIcon(ct)}</span>}
+                                  <div style={{ flex: 1, overflow: "hidden" }}>
+                                    <div style={{ fontWeight: 500, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                      {att.name}
+                                    </div>
+                                    <div style={{ fontSize: 10, color: theme.textDim }}>{formatSize(att.size)}</div>
+                                  </div>
+                                  <a
+                                    href={downloadHref}
+                                    onClick={(e) => e.stopPropagation()}
+                                    style={{ fontSize: 14, textDecoration: "none", color: theme.textMuted }}
+                                    title="Download"
+                                  >
+                                    ⬇
+                                  </a>
+                                </div>
                               </div>
-                            </a>
-                          ))}
+                            );
+                          })}
                         </div>
                       </div>
                     )}
@@ -1342,7 +1441,249 @@ export default function OutlookScraper() {
             )}
           </div>
         )}
+        {/* ─── Attachments View ─────────────────────────────────────── */}
+        {view === "attachments" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
+              📎 Attachments
+            </h2>
+            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 20 }}>
+              Browse and preview all downloaded attachments from scraped emails.
+            </p>
+
+            {/* Type Filter Tabs */}
+            <div style={{ display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap" }}>
+              {[
+                { id: "all", label: "All" },
+                { id: "image", label: "Images" },
+                { id: "pdf", label: "PDFs" },
+                { id: "document", label: "Documents" },
+                { id: "other", label: "Other" },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  onClick={() => { setAttachmentFilter(f.id); loadAttachments(f.id); }}
+                  style={{
+                    padding: "6px 14px", borderRadius: 6, fontSize: 11, fontWeight: 500,
+                    cursor: "pointer", transition: "all 0.15s",
+                    background: attachmentFilter === f.id ? theme.accent : "transparent",
+                    color: attachmentFilter === f.id ? "#fff" : theme.textMuted,
+                    border: `1px solid ${attachmentFilter === f.id ? theme.accent : theme.border}`,
+                  }}
+                >
+                  {f.label}
+                </button>
+              ))}
+              <span style={{ fontSize: 11, color: theme.textDim, alignSelf: "center", marginLeft: 8 }}>
+                {storedAttachments.length} file{storedAttachments.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+
+            {loading ? <Spinner /> : storedAttachments.length === 0 ? (
+              <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                No attachments found. Scrape emails with "Download and save all attachments" enabled.
+              </div>
+            ) : (
+              <div style={{
+                display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260, 1fr))",
+                gap: 12,
+              }}>
+                {storedAttachments.map((att) => (
+                  <div
+                    key={att.filename}
+                    style={{
+                      background: theme.surface, borderRadius: 8, padding: 16,
+                      border: `1px solid ${theme.border}`, cursor: "pointer",
+                      transition: "border-color 0.15s",
+                    }}
+                    onClick={() => setPreviewModal(att)}
+                    onMouseEnter={(e) => e.currentTarget.style.borderColor = theme.accent}
+                    onMouseLeave={(e) => e.currentTarget.style.borderColor = theme.border}
+                  >
+                    {/* Image thumbnail */}
+                    {att.file_type === "image" && (
+                      <div style={{
+                        width: "100%", height: 120, borderRadius: 6, marginBottom: 10,
+                        background: theme.bg, overflow: "hidden",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                      }}>
+                        <img
+                          src={`${API}${att.preview_url}`}
+                          alt={att.original_name}
+                          style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+                          loading="lazy"
+                        />
+                      </div>
+                    )}
+                    {/* PDF indicator */}
+                    {att.file_type === "pdf" && (
+                      <div style={{
+                        width: "100%", height: 60, borderRadius: 6, marginBottom: 10,
+                        background: `${theme.danger}15`, display: "flex",
+                        alignItems: "center", justifyContent: "center", gap: 8,
+                      }}>
+                        <span style={{ fontSize: 24 }}>📕</span>
+                        <span style={{ fontSize: 11, color: theme.danger, fontWeight: 600 }}>PDF</span>
+                      </div>
+                    )}
+                    {/* Non-image/pdf icon */}
+                    {att.file_type !== "image" && att.file_type !== "pdf" && (
+                      <div style={{
+                        width: "100%", height: 60, borderRadius: 6, marginBottom: 10,
+                        background: theme.bg, display: "flex",
+                        alignItems: "center", justifyContent: "center",
+                      }}>
+                        <span style={{ fontSize: 28 }}>{fileTypeIcon(att.content_type)}</span>
+                      </div>
+                    )}
+                    <div style={{
+                      fontSize: 12, fontWeight: 500, overflow: "hidden",
+                      textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 4,
+                    }}>
+                      {att.original_name}
+                    </div>
+                    <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 6 }}>
+                      {formatSize(att.size)} · {att.content_type.split("/").pop()}
+                    </div>
+                    {att.email_subject && (
+                      <div style={{
+                        fontSize: 10, color: theme.textMuted, overflow: "hidden",
+                        textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>
+                        From: {att.email_subject}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                      <a
+                        href={`${API}${att.download_url}`}
+                        onClick={(e) => e.stopPropagation()}
+                        style={{
+                          padding: "4px 10px", borderRadius: 4, fontSize: 10,
+                          background: theme.bg, border: `1px solid ${theme.border}`,
+                          color: theme.textMuted, textDecoration: "none",
+                        }}
+                      >
+                        Download
+                      </a>
+                      {isPreviewable(att.content_type) && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setPreviewModal(att); }}
+                          style={{
+                            padding: "4px 10px", borderRadius: 4, fontSize: 10,
+                            background: `${theme.accent}20`, border: `1px solid ${theme.accent}40`,
+                            color: theme.accent, cursor: "pointer",
+                          }}
+                        >
+                          Preview
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </main>
+
+      {/* ─── Preview Modal ──────────────────────────────────────────── */}
+      {previewModal && (
+        <div
+          style={{
+            position: "fixed", inset: 0, zIndex: 2000,
+            background: "rgba(0,0,0,0.8)", display: "flex",
+            alignItems: "center", justifyContent: "center",
+            animation: "fadeIn 0.2s ease",
+          }}
+          onClick={() => setPreviewModal(null)}
+        >
+          <div
+            style={{
+              background: theme.surface, borderRadius: 12, maxWidth: "90vw",
+              maxHeight: "90vh", overflow: "hidden", display: "flex",
+              flexDirection: "column", border: `1px solid ${theme.border}`,
+              boxShadow: "0 25px 60px rgba(0,0,0,0.5)", minWidth: 400,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div style={{
+              padding: "14px 20px", borderBottom: `1px solid ${theme.border}`,
+              display: "flex", alignItems: "center", gap: 12,
+            }}>
+              <span style={{ fontSize: 18 }}>{fileTypeIcon(previewModal.content_type)}</span>
+              <div style={{ flex: 1, overflow: "hidden" }}>
+                <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {previewModal.original_name || previewModal.name || previewModal.filename}
+                </div>
+                <div style={{ fontSize: 10, color: theme.textDim }}>
+                  {formatSize(previewModal.size)} · {previewModal.content_type}
+                  {previewModal.email_subject && ` · ${previewModal.email_subject}`}
+                </div>
+              </div>
+              <a
+                href={`${API}${previewModal.download_url || `/api/attachments/${previewModal.filename}`}`}
+                style={{
+                  padding: "6px 12px", borderRadius: 6, fontSize: 11,
+                  background: theme.accent, color: "#fff", textDecoration: "none",
+                  fontWeight: 500,
+                }}
+              >
+                Download
+              </a>
+              <button
+                onClick={() => setPreviewModal(null)}
+                style={{
+                  background: "none", border: "none", color: theme.textMuted,
+                  cursor: "pointer", fontSize: 18, padding: 4,
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div style={{ flex: 1, overflow: "auto", padding: 20, display: "flex", alignItems: "center", justifyContent: "center", minHeight: 300 }}>
+              {previewModal.content_type?.startsWith("image/") ? (
+                <img
+                  src={`${API}${previewModal.preview_url || `/api/attachments/${previewModal.filename}/preview`}`}
+                  alt={previewModal.original_name || previewModal.name}
+                  style={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain", borderRadius: 4 }}
+                />
+              ) : previewModal.content_type === "application/pdf" ? (
+                <iframe
+                  src={`${API}${previewModal.preview_url || `/api/attachments/${previewModal.filename}/preview`}`}
+                  style={{ width: "100%", height: "70vh", border: "none", borderRadius: 4, background: "#fff" }}
+                  title="PDF Preview"
+                />
+              ) : (
+                <div style={{ textAlign: "center", padding: 40 }}>
+                  <div style={{ fontSize: 48, marginBottom: 16 }}>{fileTypeIcon(previewModal.content_type)}</div>
+                  <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>
+                    {previewModal.original_name || previewModal.name || previewModal.filename}
+                  </div>
+                  <div style={{ fontSize: 12, color: theme.textMuted, marginBottom: 20 }}>
+                    {formatSize(previewModal.size)} · {previewModal.content_type}
+                  </div>
+                  <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 20 }}>
+                    Preview is not available for this file type.
+                  </div>
+                  <a
+                    href={`${API}${previewModal.download_url || `/api/attachments/${previewModal.filename}`}`}
+                    style={{
+                      padding: "10px 24px", borderRadius: 8, fontSize: 13,
+                      background: theme.accent, color: "#fff", textDecoration: "none",
+                      fontWeight: 600,
+                    }}
+                  >
+                    Download File
+                  </a>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
