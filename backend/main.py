@@ -12,6 +12,7 @@ import base64
 import logging
 import time
 import mimetypes
+import zipfile
 import imaplib
 import email
 import email.header
@@ -1032,6 +1033,43 @@ async def preview_attachment(filename: str):
     }
 
 
+class ZipDownloadRequest(BaseModel):
+    filenames: Optional[List[str]] = None  # None = all attachments
+
+
+@app.post("/api/attachments/download-zip")
+async def download_attachments_zip(request: ZipDownloadRequest):
+    """Download multiple attachments as a ZIP file."""
+    metadata = _read_attachment_metadata()
+    if request.filenames:
+        filenames = [f for f in request.filenames if f in metadata]
+    else:
+        filenames = list(metadata.keys())
+
+    if not filenames:
+        raise HTTPException(status_code=404, detail="No attachments found")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in filenames:
+            filepath = ATTACHMENTS_DIR / fname
+            if not filepath.exists():
+                continue
+            original_name = metadata.get(fname, {}).get("original_name", fname)
+            # Avoid duplicate names in ZIP by prefixing with UID part
+            arc_name = original_name
+            if arc_name in [info.filename for info in zf.infolist()]:
+                arc_name = f"{fname.split('_')[0]}_{original_name}"
+            zf.write(filepath, arc_name)
+
+    buf.seek(0)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=buf.getvalue(), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="attachments_{ts}.zip"'},
+    )
+
+
 # ─── Scrape & Export ────────────────────────────────────────────────────────
 
 def _scrape_impl(
@@ -1165,16 +1203,20 @@ async def export_csv(request: ScrapeRequest):
         "Subject", "Sender Name", "Sender Email", "To", "CC",
         "Received", "Sent", "Is Read", "Has Attachments",
         "Importance", "Categories", "Attachment Names",
+        "Attachment Filenames", "Attachment Paths",
         "Internet Message ID", "Conversation ID",
     ])
     for em in result.emails:
         to_str = "; ".join([f"{r.name} <{r.email}>" for r in em.to])
         cc_str = "; ".join([f"{r.name} <{r.email}>" for r in em.cc])
         att_names = "; ".join([a.name for a in em.attachments])
+        att_filenames = "; ".join([a.filename for a in em.attachments if a.filename])
+        att_paths = "; ".join([a.saved_path for a in em.attachments if a.saved_path])
         writer.writerow([
             em.subject, em.sender_name, em.sender_email, to_str, cc_str,
             em.received, em.sent, em.is_read, em.has_attachments,
             em.importance, "; ".join(em.categories), att_names,
+            att_filenames, att_paths,
             em.internet_message_id, em.conversation_id,
         ])
     return Response(

@@ -227,6 +227,7 @@ export default function OutlookScraper() {
   const [storedAttachments, setStoredAttachments] = useState([]);
   const [attachmentFilter, setAttachmentFilter] = useState("all");
   const [previewModal, setPreviewModal] = useState(null);
+  const [expandedScrapeCards, setExpandedScrapeCards] = useState(new Set());
   const [notification, setNotification] = useState(null);
 
   const notify = (msg, type = "info") => {
@@ -370,6 +371,7 @@ export default function OutlookScraper() {
   const runScrape = async () => {
     setLoading(true);
     setScrapeResult(null);
+    setExpandedScrapeCards(new Set());
     setError(null);
     try {
       const body = { ...scrapeConfig };
@@ -414,6 +416,33 @@ export default function OutlookScraper() {
     } catch (e) {
       notify("Export failed", "error");
     }
+  };
+
+  const downloadAllAttachments = async (filenames = null) => {
+    try {
+      const res = await fetch(`${API}/api/attachments/download-zip`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filenames }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "attachments.zip";
+      a.click();
+      URL.revokeObjectURL(url);
+      notify("Downloading attachments ZIP", "success");
+    } catch (e) {
+      notify("Failed to download attachments", "error");
+    }
+  };
+
+  const stripHtml = (html) => {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = html;
+    return tmp.textContent || tmp.innerText || "";
   };
 
   // ─── Folder Click ──────────────────────────────────────────────────────
@@ -1284,59 +1313,218 @@ export default function OutlookScraper() {
 
             {/* Scrape Results */}
             {loading && <Spinner />}
-            {scrapeResult && (
-              <div style={{
-                background: theme.surface, borderRadius: 8, padding: 20,
-                border: `1px solid ${theme.border}`,
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-                  <Badge color={theme.success}>✓ Complete</Badge>
-                  <span style={{ fontSize: 12, color: theme.textMuted }}>
-                    Scraped {scrapeResult.total_scraped} emails at {new Date(scrapeResult.exported_at).toLocaleString()}
-                  </span>
-                </div>
+            {scrapeResult && (() => {
+              const allAtts = scrapeResult.emails.flatMap((e) => e.attachments || []);
+              const totalAtts = allAtts.length;
+              const imgCount = allAtts.filter((a) => a.content_type?.startsWith("image/")).length;
+              const pdfCount = allAtts.filter((a) => a.content_type === "application/pdf").length;
+              const docCount = allAtts.filter((a) =>
+                a.content_type?.includes("word") || a.content_type?.includes("sheet") ||
+                a.content_type?.includes("excel") || a.content_type?.includes("presentation") ||
+                a.content_type?.includes("powerpoint") || a.content_type?.startsWith("text/")
+              ).length;
+              const otherCount = totalAtts - imgCount - pdfCount - docCount;
+              const savedFilenames = allAtts.filter((a) => a.filename).map((a) => a.filename);
 
-                {/* Preview table */}
-                <div style={{ overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
-                    <thead>
-                      <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
-                        {["Subject", "From", "Date", "Attachments"].map((h) => (
-                          <th key={h} style={{
-                            padding: "8px 12px", textAlign: "left",
-                            color: theme.textDim, fontWeight: 600,
-                            textTransform: "uppercase", letterSpacing: 0.5, fontSize: 10,
-                          }}>
-                            {h}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {scrapeResult.emails.slice(0, 20).map((e, i) => (
-                        <tr key={i} style={{ borderBottom: `1px solid ${theme.border}` }}>
-                          <td style={{ padding: "8px 12px", maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {e.subject}
-                          </td>
-                          <td style={{ padding: "8px 12px", color: theme.textMuted }}>{e.sender_name}</td>
-                          <td style={{ padding: "8px 12px", color: theme.textDim }}>{formatDate(e.received)}</td>
-                          <td style={{ padding: "8px 12px" }}>
-                            {e.attachments?.length > 0 && (
-                              <Badge color={theme.purple}>{e.attachments.length} file(s)</Badge>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {scrapeResult.total_scraped > 20 && (
-                  <div style={{ padding: "12px", fontSize: 11, color: theme.textDim, textAlign: "center" }}>
-                    Showing 20 of {scrapeResult.total_scraped} results. Export for full data.
+              return (
+                <div>
+                  {/* Scrape Summary */}
+                  <div style={{
+                    display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+                    gap: 12, marginBottom: 20,
+                  }}>
+                    {[
+                      { label: "Total Emails", value: scrapeResult.total_scraped, color: theme.accent },
+                      { label: "Total Attachments", value: totalAtts, color: theme.purple },
+                      { label: "Images", value: imgCount, color: theme.success },
+                      { label: "PDFs", value: pdfCount, color: theme.danger },
+                      { label: "Documents", value: docCount, color: theme.warning },
+                      ...(otherCount > 0 ? [{ label: "Other", value: otherCount, color: theme.textMuted }] : []),
+                    ].map((s) => (
+                      <div key={s.label} style={{
+                        background: theme.surface, borderRadius: 8, padding: "14px 16px",
+                        border: `1px solid ${theme.border}`,
+                      }}>
+                        <div style={{ fontSize: 9, color: theme.textDim, textTransform: "uppercase", letterSpacing: 1, fontWeight: 600, marginBottom: 6 }}>
+                          {s.label}
+                        </div>
+                        <div style={{ fontSize: 22, fontWeight: 700, color: s.color, letterSpacing: -0.5 }}>
+                          {s.value}
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                )}
-              </div>
-            )}
+
+                  {/* Action row */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+                    <Badge color={theme.success}>✓ Complete</Badge>
+                    <span style={{ fontSize: 12, color: theme.textMuted }}>
+                      Scraped {scrapeResult.total_scraped} emails at {new Date(scrapeResult.exported_at).toLocaleString()}
+                    </span>
+                    {savedFilenames.length > 0 && (
+                      <button
+                        onClick={() => downloadAllAttachments(savedFilenames)}
+                        style={{
+                          marginLeft: "auto", padding: "6px 14px", borderRadius: 6, border: "none",
+                          background: theme.purple, color: "#fff", fontSize: 11,
+                          fontWeight: 600, cursor: "pointer",
+                        }}
+                      >
+                        📦 Download All Attachments ({savedFilenames.length})
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Expandable Email Cards */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {scrapeResult.emails.map((em, i) => {
+                      const isExpanded = expandedScrapeCards.has(i);
+                      const bodyText = em.body_type === "html" ? stripHtml(em.body) : em.body;
+                      const preview = bodyText ? bodyText.substring(0, 500) : "";
+                      return (
+                        <div key={i} style={{
+                          background: theme.surface, borderRadius: 8,
+                          border: `1px solid ${theme.border}`, overflow: "hidden",
+                        }}>
+                          {/* Card Header */}
+                          <div
+                            onClick={() => {
+                              setExpandedScrapeCards((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(i)) next.delete(i); else next.add(i);
+                                return next;
+                              });
+                            }}
+                            style={{
+                              padding: "12px 16px", cursor: "pointer", display: "flex",
+                              alignItems: "center", gap: 12, transition: "background 0.15s",
+                            }}
+                            onMouseEnter={(e) => e.currentTarget.style.background = theme.surfaceHover}
+                            onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                          >
+                            <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0 }}>
+                              {isExpanded ? "▾" : "▸"}
+                            </span>
+                            <div style={{ flex: 1, overflow: "hidden" }}>
+                              <div style={{
+                                fontSize: 12, fontWeight: 600, overflow: "hidden",
+                                textOverflow: "ellipsis", whiteSpace: "nowrap",
+                              }}>
+                                {em.subject || "(No Subject)"}
+                              </div>
+                              <div style={{ fontSize: 10, color: theme.textMuted, marginTop: 2 }}>
+                                {em.sender_name} &lt;{em.sender_email}&gt;
+                              </div>
+                            </div>
+                            <span style={{ fontSize: 10, color: theme.textDim, flexShrink: 0 }}>
+                              {formatDate(em.received)}
+                            </span>
+                            {em.attachments?.length > 0 && (
+                              <Badge color={theme.purple}>{em.attachments.length} 📎</Badge>
+                            )}
+                          </div>
+
+                          {/* Expanded Content */}
+                          {isExpanded && (
+                            <div style={{
+                              padding: "0 16px 16px", borderTop: `1px solid ${theme.border}`,
+                              animation: "fadeIn 0.2s ease",
+                            }}>
+                              {/* Body Preview */}
+                              {preview && (
+                                <div style={{
+                                  padding: "12px 14px", margin: "12px 0", borderRadius: 6,
+                                  background: theme.bg, fontSize: 11, color: theme.textMuted,
+                                  lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                                }}>
+                                  {preview}{bodyText.length > 500 ? "..." : ""}
+                                </div>
+                              )}
+
+                              {/* Attachment Thumbnails */}
+                              {em.attachments?.length > 0 && (
+                                <div>
+                                  <div style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                                    Attachments ({em.attachments.length})
+                                  </div>
+                                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                                    {em.attachments.map((att, ai) => {
+                                      const ct = att.content_type || "";
+                                      const isImage = ct.startsWith("image/");
+                                      const canPreview = isPreviewable(ct);
+                                      return (
+                                        <div
+                                          key={ai}
+                                          style={{
+                                            borderRadius: 6, background: theme.bg,
+                                            border: `1px solid ${theme.border}`,
+                                            overflow: "hidden", cursor: canPreview ? "pointer" : "default",
+                                            transition: "border-color 0.15s", width: isImage ? 120 : "auto",
+                                          }}
+                                          onClick={() => {
+                                            if (canPreview && att.filename) {
+                                              setPreviewModal({
+                                                filename: att.filename,
+                                                original_name: att.name,
+                                                content_type: ct,
+                                                size: att.size,
+                                                email_subject: em.subject,
+                                                preview_url: att.preview_url,
+                                                download_url: att.download_url,
+                                              });
+                                            }
+                                          }}
+                                          onMouseEnter={(e) => e.currentTarget.style.borderColor = theme.accent}
+                                          onMouseLeave={(e) => e.currentTarget.style.borderColor = theme.border}
+                                        >
+                                          {isImage && att.preview_url && (
+                                            <div style={{
+                                              width: "100%", height: 80, overflow: "hidden",
+                                              display: "flex", alignItems: "center", justifyContent: "center",
+                                              background: "#fff",
+                                            }}>
+                                              <img
+                                                src={`${API}${att.preview_url}`}
+                                                alt={att.name}
+                                                style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+                                                loading="lazy"
+                                              />
+                                            </div>
+                                          )}
+                                          <div style={{ padding: "6px 10px", display: "flex", alignItems: "center", gap: 6 }}>
+                                            {!isImage && <span style={{ fontSize: 14 }}>{fileTypeIcon(ct)}</span>}
+                                            <div style={{ flex: 1, overflow: "hidden" }}>
+                                              <div style={{ fontSize: 10, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                {att.name}
+                                              </div>
+                                              <div style={{ fontSize: 9, color: theme.textDim }}>{formatSize(att.size)}</div>
+                                            </div>
+                                            {att.download_url && (
+                                              <a
+                                                href={`${API}${att.download_url}`}
+                                                onClick={(e) => e.stopPropagation()}
+                                                style={{ fontSize: 12, textDecoration: "none", color: theme.textMuted }}
+                                                title="Download"
+                                              >
+                                                ⬇
+                                              </a>
+                                            )}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
