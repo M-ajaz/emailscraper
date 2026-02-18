@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-IMAP_HOST = os.getenv("IMAP_HOST", "outlook.office365.com")
+IMAP_HOST = os.getenv("IMAP_SERVER", os.getenv("IMAP_HOST", "imap.gmail.com"))
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 
 ATTACHMENTS_DIR = Path("./attachments")
@@ -523,6 +523,7 @@ class ScrapeRequest(BaseModel):
     to_date: Optional[str] = None
     sender_filter: Optional[str] = None
     subject_filter: Optional[str] = None
+    search: Optional[str] = None
     max_results: int = Field(default=50, ge=1, le=500)
     include_attachments: bool = True
 
@@ -878,13 +879,14 @@ def _scrape_impl(
     conn: imaplib.IMAP4_SSL,
     folder_id: str = None, from_date: str = None, to_date: str = None,
     sender_filter: str = None, subject_filter: str = None,
+    search: str = None,
     max_results: int = 50, include_attachments: bool = True,
 ) -> List[ScrapedEmailData]:
     folder = folder_id or "INBOX"
     conn.select(f'"{folder}"', readonly=True)
 
     criteria = _build_search_criteria(
-        from_date=from_date, to_date=to_date,
+        search=search, from_date=from_date, to_date=to_date,
         sender=sender_filter, subject_filter=subject_filter,
     )
 
@@ -967,7 +969,7 @@ async def scrape_emails(request: ScrapeRequest):
         _scrape_impl,
         folder_id=request.folder_id, from_date=request.from_date,
         to_date=request.to_date, sender_filter=request.sender_filter,
-        subject_filter=request.subject_filter,
+        subject_filter=request.subject_filter, search=request.search,
         max_results=request.max_results,
         include_attachments=request.include_attachments,
     )

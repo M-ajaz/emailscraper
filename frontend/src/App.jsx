@@ -216,9 +216,11 @@ export default function OutlookScraper() {
   const [searchQuery, setSearchQuery] = useState("");
   const debouncedSearch = useDebounce(searchQuery, 300);
   const [pagination, setPagination] = useState({ skip: 0, top: 25, total: 0 });
+  const [inboxFilters, setInboxFilters] = useState({ from_date: "", to_date: "", sender: "" });
+  const [showInboxFilters, setShowInboxFilters] = useState(false);
   const [scrapeConfig, setScrapeConfig] = useState({
     folder_id: "", from_date: "", to_date: "",
-    sender_filter: "", subject_filter: "",
+    sender_filter: "", subject_filter: "", search: "",
     max_results: 50, include_attachments: true,
   });
   const [scrapeResult, setScrapeResult] = useState(null);
@@ -237,7 +239,7 @@ export default function OutlookScraper() {
   // ─── Auto-search on debounced input ────────────────────────────────────
   useEffect(() => {
     if (auth.authenticated && debouncedSearch !== undefined) {
-      loadEmails(activeFolder, 0, debouncedSearch);
+      loadEmails(activeFolder, 0, debouncedSearch, inboxFilters);
     }
   }, [debouncedSearch]);
 
@@ -299,13 +301,16 @@ export default function OutlookScraper() {
     }
   };
 
-  const loadEmails = async (folderId = null, skip = 0, search = "") => {
+  const loadEmails = async (folderId = null, skip = 0, search = "", filters = {}) => {
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams({ skip: String(skip), top: "25" });
       if (folderId) params.set("folder_id", folderId);
       if (search) params.set("search", search);
+      if (filters.from_date) params.set("from_date", filters.from_date);
+      if (filters.to_date) params.set("to_date", filters.to_date);
+      if (filters.sender) params.set("sender", filters.sender);
       const res = await fetch(`${API}/api/emails?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -399,13 +404,13 @@ export default function OutlookScraper() {
     setActiveFolder(f.id);
     setView("inbox");
     setSelectedEmail(null);
-    loadEmails(f.id);
+    loadEmails(f.id, 0, searchQuery, inboxFilters);
   };
 
   // ─── Search (form submit for explicit search) ─────────────────────────
   const handleSearch = (e) => {
     e.preventDefault();
-    loadEmails(activeFolder, 0, searchQuery);
+    loadEmails(activeFolder, 0, searchQuery, inboxFilters);
   };
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -613,7 +618,7 @@ export default function OutlookScraper() {
         {/* Nav */}
         <nav style={{ padding: "8px", flex: 1, overflowY: "auto" }}>
           {[
-            { id: "inbox", icon: "📥", label: "All Mail", action: () => { setView("inbox"); setActiveFolder(null); setSelectedEmail(null); loadEmails(); } },
+            { id: "inbox", icon: "📥", label: "All Mail", action: () => { setView("inbox"); setActiveFolder(null); setSelectedEmail(null); loadEmails(null, 0, searchQuery, inboxFilters); } },
             { id: "scrape", icon: "🔍", label: "Scrape & Export", action: () => { setView("scrape"); setSelectedEmail(null); } },
             { id: "stats", icon: "📊", label: "Statistics", action: () => { setView("stats"); setSelectedEmail(null); loadStats(); } },
           ].map((item) => (
@@ -733,7 +738,101 @@ export default function OutlookScraper() {
                 />
                 <IconBtn type="submit" onClick={handleSearch}>Search</IconBtn>
               </form>
-              <IconBtn onClick={() => loadEmails(activeFolder, pagination.skip, searchQuery)}>↻ Refresh</IconBtn>
+              <IconBtn onClick={() => loadEmails(activeFolder, pagination.skip, searchQuery, inboxFilters)}>↻ Refresh</IconBtn>
+            </div>
+
+            {/* Advanced Filters */}
+            <div style={{ borderBottom: `1px solid ${theme.border}` }}>
+              <button
+                onClick={() => setShowInboxFilters(!showInboxFilters)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8, width: "100%",
+                  padding: "8px 20px", background: "transparent", border: "none",
+                  color: theme.textMuted, cursor: "pointer", fontSize: 11, fontWeight: 500,
+                }}
+              >
+                <span>{showInboxFilters ? "▾" : "▸"}</span>
+                <span>Advanced Filters</span>
+                {(inboxFilters.from_date || inboxFilters.to_date || inboxFilters.sender) && (
+                  <Badge color={theme.accent}>Active</Badge>
+                )}
+              </button>
+              {showInboxFilters && (
+                <div style={{ padding: "0 20px 12px", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+                  <div>
+                    <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      From Date
+                    </label>
+                    <input
+                      type="date"
+                      value={inboxFilters.from_date}
+                      onChange={(e) => setInboxFilters({ ...inboxFilters, from_date: e.target.value })}
+                      style={{
+                        padding: "6px 10px", borderRadius: 6,
+                        background: theme.bg, border: `1px solid ${theme.border}`,
+                        color: theme.text, fontSize: 11,
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      To Date
+                    </label>
+                    <input
+                      type="date"
+                      value={inboxFilters.to_date}
+                      onChange={(e) => setInboxFilters({ ...inboxFilters, to_date: e.target.value })}
+                      style={{
+                        padding: "6px 10px", borderRadius: 6,
+                        background: theme.bg, border: `1px solid ${theme.border}`,
+                        color: theme.text, fontSize: 11,
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      Sender
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="sender@example.com"
+                      value={inboxFilters.sender}
+                      onChange={(e) => setInboxFilters({ ...inboxFilters, sender: e.target.value })}
+                      style={{
+                        padding: "6px 10px", borderRadius: 6, minWidth: 180,
+                        background: theme.bg, border: `1px solid ${theme.border}`,
+                        color: theme.text, fontSize: 11,
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button
+                      onClick={() => loadEmails(activeFolder, 0, searchQuery, inboxFilters)}
+                      style={{
+                        padding: "6px 14px", borderRadius: 6, border: "none",
+                        background: theme.accent, color: "#fff", fontSize: 11,
+                        fontWeight: 600, cursor: "pointer",
+                      }}
+                    >
+                      Apply
+                    </button>
+                    <button
+                      onClick={() => {
+                        const cleared = { from_date: "", to_date: "", sender: "" };
+                        setInboxFilters(cleared);
+                        loadEmails(activeFolder, 0, searchQuery, cleared);
+                      }}
+                      style={{
+                        padding: "6px 14px", borderRadius: 6,
+                        background: "transparent", border: `1px solid ${theme.border}`,
+                        color: theme.textMuted, fontSize: 11, cursor: "pointer",
+                      }}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
@@ -769,7 +868,7 @@ export default function OutlookScraper() {
                     <div style={{ display: "flex", gap: 6 }}>
                       <IconBtn
                         onClick={() => {
-                          if (pagination.skip > 0) loadEmails(activeFolder, Math.max(0, pagination.skip - 25), searchQuery);
+                          if (pagination.skip > 0) loadEmails(activeFolder, Math.max(0, pagination.skip - 25), searchQuery, inboxFilters);
                         }}
                         style={{ opacity: pagination.skip === 0 ? 0.3 : 1, pointerEvents: pagination.skip === 0 ? "none" : "auto" }}
                       >
@@ -777,7 +876,7 @@ export default function OutlookScraper() {
                       </IconBtn>
                       <IconBtn
                         onClick={() => {
-                          if (pagination.skip + 25 < pagination.total) loadEmails(activeFolder, pagination.skip + 25, searchQuery);
+                          if (pagination.skip + 25 < pagination.total) loadEmails(activeFolder, pagination.skip + 25, searchQuery, inboxFilters);
                         }}
                         style={{ opacity: pagination.skip + 25 >= pagination.total ? 0.3 : 1, pointerEvents: pagination.skip + 25 >= pagination.total ? "none" : "auto" }}
                       >
@@ -906,8 +1005,11 @@ export default function OutlookScraper() {
             <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
               🔍 Scrape & Export
             </h2>
-            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 24 }}>
+            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 8 }}>
               Configure filters to bulk-scrape emails with all metadata and attachments.
+            </p>
+            <p style={{ color: theme.textDim, fontSize: 11, marginBottom: 24, fontStyle: "italic" }}>
+              All filters are optional and work independently or combined.
             </p>
 
             <div style={{
@@ -1023,6 +1125,24 @@ export default function OutlookScraper() {
                   }}
                 />
               </div>
+
+              {/* Keyword Search (full width) */}
+              <div style={{ gridColumn: "1 / -1" }}>
+                <label style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, marginBottom: 6, display: "block", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  Keyword Search
+                </label>
+                <input
+                  type="text"
+                  placeholder="Search in email body and headers..."
+                  value={scrapeConfig.search}
+                  onChange={(e) => setScrapeConfig({ ...scrapeConfig, search: e.target.value })}
+                  style={{
+                    width: "100%", padding: "8px 12px", borderRadius: 6,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                    color: theme.text, fontSize: 12,
+                  }}
+                />
+              </div>
             </div>
 
             {/* Include Attachments Toggle */}
@@ -1056,6 +1176,11 @@ export default function OutlookScraper() {
               </button>
               <IconBtn onClick={() => exportData("json")}>Export JSON</IconBtn>
               <IconBtn onClick={() => exportData("csv")}>Export CSV</IconBtn>
+              <IconBtn onClick={() => setScrapeConfig({
+                folder_id: "", from_date: "", to_date: "",
+                sender_filter: "", subject_filter: "", search: "",
+                max_results: 50, include_attachments: true,
+              })}>Clear Filters</IconBtn>
             </div>
 
             {/* Scrape Results */}
