@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 
-from database import SessionLocal, Candidate, create_tables
+from database import SessionLocal, Candidate, JobRequisition, Notification, create_tables
 from parsers import (
     extract_text_from_pdf, extract_text_from_docx, extract_entities,
     extract_name_from_subject, extract_title_from_subject,
@@ -157,6 +157,39 @@ def process_attachment_into_candidate(
         db.commit()
         db.refresh(candidate)
         logger.info("Saved candidate id=%s name=%s", candidate.id, candidate.name)
+
+        # ── Notifications ─────────────────────────────────────────────
+        # Always create a "new_candidate" notification
+        try:
+            db.add(Notification(
+                type="new_candidate",
+                title="New Candidate",
+                message=f"{candidate.name} added from email",
+                candidate_id=candidate.id,
+            ))
+
+            # Quick skill match against all jobs
+            cand_skills = {s.lower() for s in json.loads(candidate.skills or "[]")}
+            if cand_skills:
+                jobs = db.query(JobRequisition).all()
+                for job in jobs:
+                    job_skills = {s.lower() for s in json.loads(job.required_skills or "[]")}
+                    if not job_skills:
+                        continue
+                    overlap = len(cand_skills & job_skills)
+                    score = round((overlap / len(job_skills)) * 100)
+                    if score >= 75:
+                        db.add(Notification(
+                            type="new_high_fit",
+                            title="High-Fit Match",
+                            message=f"{candidate.name} matches {job.title} ({score}%)",
+                            candidate_id=candidate.id,
+                            job_id=job.id,
+                        ))
+
+            db.commit()
+        except Exception:
+            logger.exception("Failed to create notifications for candidate %s", candidate.id)
 
         return {
             "id": candidate.id,

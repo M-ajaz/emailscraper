@@ -38,7 +38,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from database import (
     create_tables as _create_db_tables, DB_PATH,
     SessionLocal, Candidate, JobRequisition, MatchResult, ScrapedEmail, Attachment,
-    SchedulerConfig,
+    SchedulerConfig, Notification,
 )
 from parsers import extract_text_from_pdf, extract_text_from_docx, extract_entities
 from pipeline import process_attachment_into_candidate
@@ -2327,6 +2327,18 @@ async def run_scheduled_scrape():
             cfg.next_run_at = now + timedelta(minutes=cfg.interval_minutes or 30)
             db.commit()
 
+        # Create scrape_complete notification
+        try:
+            db.add(Notification(
+                type="scrape_complete",
+                title="Scrape Complete",
+                message=f"Found {len(emails)} emails, {new_candidates} new candidates",
+            ))
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to create scrape_complete notification")
+
         logger.info(
             "Scheduled scrape complete: %d emails, %d new candidates",
             len(emails), new_candidates,
@@ -2451,6 +2463,94 @@ async def scheduler_run_now():
         "message": "Scrape started",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ─── Notifications ─────────────────────────────────────────────────────────
+
+def _notification_to_dict(n: Notification) -> dict:
+    created = n.created_at
+    if created and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return {
+        "id": n.id,
+        "type": n.type,
+        "title": n.title,
+        "message": n.message,
+        "job_id": n.job_id,
+        "candidate_id": n.candidate_id,
+        "is_read": n.is_read,
+        "created_at": created.isoformat() if created else None,
+    }
+
+
+@app.get("/api/notifications")
+async def get_notifications(limit: int = 50, offset: int = 0, unread_only: bool = False):
+    """Return notifications ordered by newest first."""
+    db = SessionLocal()
+    try:
+        q = db.query(Notification)
+        if unread_only:
+            q = q.filter(Notification.is_read == False)
+        q = q.order_by(Notification.created_at.desc())
+        total = q.count()
+        items = q.offset(offset).limit(limit).all()
+        return {
+            "notifications": [_notification_to_dict(n) for n in items],
+            "total": total,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/notifications/count")
+async def get_notification_count():
+    """Return count of unread notifications."""
+    db = SessionLocal()
+    try:
+        unread = db.query(Notification).filter(Notification.is_read == False).count()
+        total = db.query(Notification).count()
+        return {"unread": unread, "total": total}
+    finally:
+        db.close()
+
+
+@app.patch("/api/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: int):
+    """Mark a single notification as read."""
+    db = SessionLocal()
+    try:
+        n = db.query(Notification).filter(Notification.id == notification_id).first()
+        if not n:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        n.is_read = True
+        db.commit()
+        return _notification_to_dict(n)
+    finally:
+        db.close()
+
+
+@app.patch("/api/notifications/read-all")
+async def mark_all_notifications_read():
+    """Mark all notifications as read."""
+    db = SessionLocal()
+    try:
+        count = db.query(Notification).filter(Notification.is_read == False).update({"is_read": True})
+        db.commit()
+        return {"marked_read": count}
+    finally:
+        db.close()
+
+
+@app.delete("/api/notifications/clear")
+async def clear_notifications():
+    """Delete all notifications."""
+    db = SessionLocal()
+    try:
+        count = db.query(Notification).delete()
+        db.commit()
+        return {"deleted": count}
+    finally:
+        db.close()
 
 
 # ─── Health Check ───────────────────────────────────────────────────────────

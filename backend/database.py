@@ -124,6 +124,19 @@ class SchedulerConfig(Base):
     candidates_added_last_run = Column(Integer, default=0)
 
 
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(Text, nullable=False)           # "new_candidate", "new_high_fit", "scrape_complete"
+    title = Column(Text, nullable=False)
+    message = Column(Text, nullable=True)
+    job_id = Column(Integer, nullable=True)
+    candidate_id = Column(Integer, nullable=True)
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
 # ─── Table creation ──────────────────────────────────────────────────────────
 
 def create_tables():
