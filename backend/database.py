@@ -41,6 +41,8 @@ class Candidate(Base):
     years_exp = Column(Float, nullable=True)
     raw_resume_path = Column(String(500), nullable=True)
     source_email_uid = Column(String(100), nullable=True)
+    notes = Column(Text, nullable=True)
+    tags = Column(Text, nullable=True, default="[]")   # JSON array of strings
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     matches = relationship("MatchResult", back_populates="candidate")
@@ -75,11 +77,83 @@ class MatchResult(Base):
     candidate = relationship("Candidate", back_populates="matches")
 
 
+class ScrapedEmail(Base):
+    __tablename__ = "scraped_emails"
+
+    id = Column(Integer, primary_key=True, index=True)
+    uid = Column(Text, unique=True, nullable=False, index=True)
+    folder = Column(Text, nullable=True)
+    subject = Column(Text, nullable=True)
+    sender = Column(Text, nullable=True)
+    sender_email = Column(Text, nullable=True)
+    date = Column(Text, nullable=True)
+    body_text = Column(Text, nullable=True)
+    body_html = Column(Text, nullable=True)
+    has_attachments = Column(Boolean, default=False)
+    attachment_count = Column(Integer, default=0)
+    is_read = Column(Boolean, default=False)
+    scraped_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class Attachment(Base):
+    __tablename__ = "attachments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(Text, unique=True, nullable=False, index=True)
+    original_name = Column(Text, nullable=True)
+    content_type = Column(Text, nullable=True)
+    size = Column(Integer, default=0)
+    email_uid = Column(Text, nullable=True)
+    email_subject = Column(Text, nullable=True)
+    email_sender = Column(Text, nullable=True)
+    email_date = Column(Text, nullable=True)
+    saved_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class SchedulerConfig(Base):
+    __tablename__ = "scheduler_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    enabled = Column(Boolean, default=False)
+    interval_minutes = Column(Integer, default=30)
+    folder = Column(Text, default="INBOX")
+    subject_filter = Column(Text, nullable=True)
+    last_run_at = Column(DateTime, nullable=True)
+    next_run_at = Column(DateTime, nullable=True)
+    emails_found_last_run = Column(Integer, default=0)
+    candidates_added_last_run = Column(Integer, default=0)
+
+
 # ─── Table creation ──────────────────────────────────────────────────────────
 
 def create_tables():
     """Create all tables in the SQLite database if they don't already exist."""
     Base.metadata.create_all(bind=engine)
+    _migrate_tables()
+
+
+def _migrate_tables():
+    """Add columns that may be missing from older schemas."""
+    import sqlite3
+    conn = sqlite3.connect(str(DB_PATH))
+    cursor = conn.cursor()
+    # Candidates table migrations
+    cursor.execute("PRAGMA table_info(candidates)")
+    existing = {row[1] for row in cursor.fetchall()}
+    if "notes" not in existing:
+        cursor.execute("ALTER TABLE candidates ADD COLUMN notes TEXT")
+    if "tags" not in existing:
+        cursor.execute("ALTER TABLE candidates ADD COLUMN tags TEXT DEFAULT '[]'")
+    # SchedulerConfig table — ensure it exists (create_all handles this,
+    # but we seed a default row if the table is empty)
+    cursor.execute("SELECT COUNT(*) FROM scheduler_config")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO scheduler_config (enabled, interval_minutes, folder) "
+            "VALUES (0, 30, 'INBOX')"
+        )
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":

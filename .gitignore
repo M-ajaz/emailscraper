@@ -17,6 +17,8 @@ dist/
 # App-specific
 token_cache.json
 attachments/
+.session.json
+*.db
 
 # OS
 .DS_Store

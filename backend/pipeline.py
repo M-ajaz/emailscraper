@@ -10,7 +10,10 @@ import logging
 from pathlib import Path
 
 from database import SessionLocal, Candidate, create_tables
-from parsers import extract_text_from_pdf, extract_text_from_docx, extract_entities
+from parsers import (
+    extract_text_from_pdf, extract_text_from_docx, extract_entities,
+    extract_name_from_subject, extract_title_from_subject,
+)
 from extractors import extract_email_metadata, merge_profile, find_existing_candidate
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,7 @@ def process_attachment_into_candidate(
     email_uid: str,
     email_body: str,
     email_sender: str,
+    email_subject: str = "",
 ) -> dict | None:
     """
     End-to-end pipeline: attachment file → parsed candidate → DB row.
@@ -37,6 +41,9 @@ def process_attachment_into_candidate(
         Plain-text body of the email that carried the attachment.
     email_sender : str
         Sender email address from the email headers.
+    email_subject : str
+        Subject line of the email (used to extract candidate name / title
+        from forwarded recruitment patterns).
 
     Returns
     -------
@@ -94,6 +101,18 @@ def process_attachment_into_candidate(
     # Use header sender address as fallback email
     if not email_data.get("email") and email_sender:
         email_data["email"] = email_sender.strip().lower()
+
+    # ── 4b. Extract name and title from email subject line ─────────────
+    if email_subject:
+        subject_name = extract_name_from_subject(email_subject)
+        if subject_name and not resume_data.get("name") and not email_data.get("name"):
+            email_data["name"] = subject_name
+
+        subject_title = extract_title_from_subject(email_subject)
+        if subject_title:
+            existing_titles = [t.lower() for t in resume_data.get("titles", [])]
+            if subject_title.lower() not in existing_titles:
+                resume_data.setdefault("titles", []).append(subject_title)
 
     # ── 5. Merge resume + email into a unified profile ───────────────────
     try:

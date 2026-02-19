@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, memo } from "react";
+import React, { useState, useEffect, useCallback, useRef, memo } from "react";
 
 const API = (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) || "http://localhost:8000";
 
@@ -204,7 +204,7 @@ export default function OutlookScraper() {
   const [auth, setAuth] = useState({ loading: true, authenticated: false, user: null });
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [loginLoading, setLoginLoading] = useState(false);
-  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments | candidates | jobs | recruit-export
+  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments | candidates | candidateProfile | jobs | recruit-export | settings
   const [folders, setFolders] = useState([]);
   const [emails, setEmails] = useState([]);
   const [selectedEmail, setSelectedEmail] = useState(null);
@@ -234,6 +234,7 @@ export default function OutlookScraper() {
   const [candidates, setCandidates] = useState([]);
   const [candidateSearch, setCandidateSearch] = useState("");
   const debouncedCandSearch = useDebounce(candidateSearch, 300);
+  const [showDuplicatesOnly, setShowDuplicatesOnly] = useState(false);
   const [jobs, setJobs] = useState([]);
   const [selectedJobId, setSelectedJobId] = useState(null);
   const [matchResults, setMatchResults] = useState([]);
@@ -243,16 +244,84 @@ export default function OutlookScraper() {
     min_exp: 0, location: "", remote_ok: false,
   });
   const [exportJobId, setExportJobId] = useState("");
+  const [jdUploading, setJdUploading] = useState(false);
+  const [tagFilter, setTagFilter] = useState("");
+  const [selectedCandidate, setSelectedCandidate] = useState(null);
+  const [selectedCandidateId, setSelectedCandidateId] = useState(null);
+  const [candidateProfile, setCandidateProfile] = useState(null);
+  const [profileActiveTab, setProfileActiveTab] = useState("resume");
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileNotesSaved, setProfileNotesSaved] = useState(false);
+  const [expandedCandidateId, setExpandedCandidateId] = useState(null);
+  const [expandedMatchIdx, setExpandedMatchIdx] = useState(null);
+  const [candidateNotesDraft, setCandidateNotesDraft] = useState({});
+  const [candidateTagInput, setCandidateTagInput] = useState({});
+  const SUGGESTED_TAGS = ["Shortlisted", "Rejected", "On Hold", "Interview Scheduled", "Offer Sent"];
+  const [dbStats, setDbStats] = useState({ candidates: 0, emails: 0 });
+  const [emailsFromCache, setEmailsFromCache] = useState(false);
+  const [storageHealth, setStorageHealth] = useState(null);
+  const [storageLastUpdated, setStorageLastUpdated] = useState(null);
+  const [clearConfirmText, setClearConfirmText] = useState("");
+  const [showClearModal, setShowClearModal] = useState(false);
+  const [schedulerConfig, setSchedulerConfig] = useState(null);
+  const [schedulerLoading, setSchedulerLoading] = useState(false);
+  const [schedulerForm, setSchedulerForm] = useState({ interval_minutes: 30, folder: "INBOX", subject_filter: "" });
+  const [schedulerRunNow, setSchedulerRunNow] = useState(false);
+  const [schedulerCountdown, setSchedulerCountdown] = useState(null);
 
   const notify = (msg, type = "info") => {
     setNotification({ msg, type });
     setTimeout(() => setNotification(null), 4000);
   };
 
+  // ─── Pre-load cached data from SQLite on mount ─────────────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        const [candRes, emailRes] = await Promise.all([
+          fetch(`${API}/api/candidates`).catch(() => null),
+          fetch(`${API}/api/emails?source=cache`).catch(() => null),
+        ]);
+        if (candRes && candRes.ok) {
+          const data = await candRes.json();
+          setCandidates(data);
+          setDbStats((prev) => ({ ...prev, candidates: data.length }));
+        }
+        if (emailRes && emailRes.ok) {
+          const data = await emailRes.json();
+          if (data.emails?.length) {
+            setEmails(data.emails);
+            setPagination({ skip: 0, top: 25, total: data.total || 0 });
+            setEmailsFromCache(true);
+            setDbStats((prev) => ({ ...prev, emails: data.total || 0 }));
+          }
+        }
+      } catch (_) { /* silent pre-load */ }
+    })();
+  }, []);
+
   // ─── Auth ───────────────────────────────────────────────────────────────
   useEffect(() => {
     checkAuth();
   }, []);
+
+  // ─── Auto-refresh storage health every 30s when on settings view ────────
+  useEffect(() => {
+    if (view !== "settings") return;
+    loadStorageHealth();
+    loadSchedulerConfig();
+    const interval = setInterval(() => { loadStorageHealth(); loadSchedulerConfig(); }, 30000);
+    return () => clearInterval(interval);
+  }, [view]);
+
+  // ─── Scheduler countdown timer (ticks every second) ───────────────────
+  useEffect(() => {
+    if (view !== "settings" || schedulerCountdown == null) return;
+    const tick = setInterval(() => {
+      setSchedulerCountdown((prev) => (prev != null && prev > 0) ? prev - 1 : 0);
+    }, 1000);
+    return () => clearInterval(tick);
+  }, [view, schedulerCountdown != null]);
 
   // ─── Auto-search on debounced input ────────────────────────────────────
   useEffect(() => {
@@ -341,9 +410,27 @@ export default function OutlookScraper() {
       const data = await res.json();
       setEmails(data.emails || []);
       setPagination({ skip, top: 25, total: data.total || 0 });
+      setEmailsFromCache(false);
     } catch (e) {
-      notify("Failed to load emails", "error");
-      setError("Failed to load emails. Check your connection.");
+      // IMAP failed — try cache fallback if we don't already have cached emails
+      if (!emailsFromCache) {
+        try {
+          const cacheParams = new URLSearchParams({ skip: String(skip), top: "25", source: "cache" });
+          if (folderId) cacheParams.set("folder_id", folderId);
+          if (search) cacheParams.set("search", search);
+          if (filters.sender) cacheParams.set("sender", filters.sender);
+          const cRes = await fetch(`${API}/api/emails?${cacheParams}`);
+          if (cRes.ok) {
+            const cData = await cRes.json();
+            if (cData.emails?.length) {
+              setEmails(cData.emails);
+              setPagination({ skip, top: 25, total: cData.total || 0 });
+              setEmailsFromCache(true);
+            }
+          }
+        } catch (_) { /* cache fallback also failed */ }
+      }
+      notify("IMAP unavailable — showing cached emails", "error");
     }
     setLoading(false);
   };
@@ -481,15 +568,123 @@ export default function OutlookScraper() {
   };
 
   // ─── Recruitment Data Loading ─────────────────────────────────────────
-  const loadCandidates = async (search = "") => {
+  const loadCandidates = async (search = "", tagF = tagFilter) => {
     try {
       const params = new URLSearchParams();
       if (search) params.set("name", search);
+      if (tagF) params.set("tag", tagF);
       const res = await fetch(`${API}/api/candidates?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setCandidates(await res.json());
+      const data = await res.json();
+      setCandidates(data);
+      if (!search && !tagF) setDbStats((prev) => ({ ...prev, candidates: data.length }));
     } catch (e) {
       notify("Failed to load candidates", "error");
+    }
+  };
+
+  const deleteCandidate = async (id) => {
+    try {
+      const res = await fetch(`${API}/api/candidates/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      notify("Candidate removed", "success");
+      loadCandidates(candidateSearch);
+    } catch (e) {
+      notify("Failed to delete candidate", "error");
+    }
+  };
+
+  const saveCandidateNotes = async (id, notes) => {
+    try {
+      const res = await fetch(`${API}/api/candidates/${id}/notes`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setCandidates((prev) => prev.map((c) => c.id === id ? { ...c, notes } : c));
+    } catch (e) {
+      notify("Failed to save notes", "error");
+    }
+  };
+
+  const saveCandidateTags = async (id, tags) => {
+    try {
+      const res = await fetch(`${API}/api/candidates/${id}/tags`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tags }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setCandidates((prev) => prev.map((c) => c.id === id ? { ...c, tags } : c));
+    } catch (e) {
+      notify("Failed to save tags", "error");
+    }
+  };
+
+  const addTagToCandidate = (id, tag) => {
+    const c = candidates.find((x) => x.id === id);
+    if (!c) return;
+    const current = c.tags || [];
+    if (current.some((t) => t.toLowerCase() === tag.toLowerCase())) return;
+    const updated = [...current, tag];
+    saveCandidateTags(id, updated);
+  };
+
+  const removeTagFromCandidate = (id, tag) => {
+    const c = candidates.find((x) => x.id === id);
+    if (!c) return;
+    const updated = (c.tags || []).filter((t) => t !== tag);
+    saveCandidateTags(id, updated);
+  };
+
+  const loadStorageHealth = async () => {
+    try {
+      const res = await fetch(`${API}/api/storage/health`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStorageHealth(await res.json());
+      setStorageLastUpdated(new Date());
+    } catch (e) {
+      notify("Failed to load storage health", "error");
+    }
+  };
+
+  const loadSchedulerConfig = async () => {
+    try {
+      const res = await fetch(`${API}/api/scheduler/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setSchedulerConfig(data);
+      setSchedulerForm({
+        interval_minutes: data.interval_minutes || 30,
+        folder: data.folder || "INBOX",
+        subject_filter: data.subject_filter || "",
+      });
+      if (data.time_until_next_run_seconds != null) {
+        setSchedulerCountdown(data.time_until_next_run_seconds);
+      } else {
+        setSchedulerCountdown(null);
+      }
+    } catch (_) { /* silent */ }
+  };
+
+  const openCandidateProfile = async (id) => {
+    setSelectedCandidateId(id);
+    setCandidateProfile(null);
+    setProfileActiveTab("resume");
+    setExpandedMatchIdx(null);
+    setProfileLoading(true);
+    setView("candidateProfile");
+    try {
+      const res = await fetch(`${API}/api/candidates/${id}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setCandidateProfile(data);
+      setSelectedCandidate(data);
+    } catch (e) {
+      notify(`Failed to load candidate profile: ${e.message}`, "error");
+    } finally {
+      setProfileLoading(false);
     }
   };
 
@@ -525,6 +720,33 @@ export default function OutlookScraper() {
     } catch (e) {
       notify("Failed to create job", "error");
     }
+  };
+
+  const uploadJD = async (file) => {
+    setJdUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${API}/api/jobs/upload-jd`, { method: "POST", body: fd });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setJobForm((prev) => ({
+        ...prev,
+        jd_raw: data.raw_text || prev.jd_raw,
+        title: data.title || prev.title,
+        required_skills: (data.required_skills || []).join(", ") || prev.required_skills,
+        min_exp: data.min_exp ?? prev.min_exp,
+        location: data.location || prev.location,
+        remote_ok: data.remote_ok ?? prev.remote_ok,
+      }));
+      notify("JD parsed — review and save", "success");
+    } catch (e) {
+      notify(`JD upload failed: ${e.message}`, "error");
+    }
+    setJdUploading(false);
   };
 
   const runJobMatch = async (jobId) => {
@@ -797,9 +1019,10 @@ export default function OutlookScraper() {
             { id: "scrape", icon: "🔍", label: "Scrape & Export", action: () => { setView("scrape"); setSelectedEmail(null); } },
             { id: "attachments", icon: "📎", label: "Attachments", badge: storedAttachments.length || null, action: () => { setView("attachments"); setSelectedEmail(null); loadAttachments(attachmentFilter); } },
             { id: "stats", icon: "📊", label: "Statistics", action: () => { setView("stats"); setSelectedEmail(null); loadStats(); } },
-            { id: "candidates", icon: "👤", label: "Candidates", action: () => { setView("candidates"); setSelectedEmail(null); loadCandidates(candidateSearch); } },
+            { id: "candidates", icon: "👤", label: "Candidates", action: () => { setView("candidates"); setSelectedEmail(null); setSelectedCandidateId(null); setCandidateProfile(null); loadCandidates(candidateSearch); } },
             { id: "jobs", icon: "💼", label: "Jobs & Match", action: () => { setView("jobs"); setSelectedEmail(null); loadJobs(); } },
             { id: "recruit-export", icon: "📤", label: "Recruit Export", action: () => { setView("recruit-export"); setSelectedEmail(null); loadJobs(); } },
+            { id: "settings", icon: "⚙️", label: "Settings", action: () => { setView("settings"); setSelectedEmail(null); } },
           ].map((item) => (
             <button
               key={item.id}
@@ -807,8 +1030,8 @@ export default function OutlookScraper() {
               style={{
                 display: "flex", alignItems: "center", gap: 10, width: "100%",
                 padding: sidebarOpen ? "8px 12px" : "8px", borderRadius: 6,
-                background: view === item.id && !activeFolder ? theme.accentGlow : "transparent",
-                border: "none", color: view === item.id && !activeFolder ? theme.accent : theme.textMuted,
+                background: (view === item.id || (item.id === "candidates" && view === "candidateProfile")) && !activeFolder ? theme.accentGlow : "transparent",
+                border: "none", color: (view === item.id || (item.id === "candidates" && view === "candidateProfile")) && !activeFolder ? theme.accent : theme.textMuted,
                 cursor: "pointer", fontSize: 12, fontWeight: 500, textAlign: "left",
                 transition: "all 0.15s", justifyContent: sidebarOpen ? "flex-start" : "center",
               }}
@@ -864,6 +1087,22 @@ export default function OutlookScraper() {
             </>
           )}
         </nav>
+
+        {/* DB Stats */}
+        {sidebarOpen && (dbStats.candidates > 0 || dbStats.emails > 0) && (
+          <div style={{
+            padding: "8px 16px", borderTop: `1px solid ${theme.border}`,
+            fontSize: 10, color: theme.textDim, lineHeight: 1.5,
+            display: "flex", alignItems: "center", gap: 6,
+          }}>
+            <span style={{ opacity: 0.6 }}>DB</span>
+            <span>
+              {dbStats.candidates > 0 && `${dbStats.candidates} candidate${dbStats.candidates !== 1 ? "s" : ""}`}
+              {dbStats.candidates > 0 && dbStats.emails > 0 && " · "}
+              {dbStats.emails > 0 && `${dbStats.emails} email${dbStats.emails !== 1 ? "s" : ""} stored`}
+            </span>
+          </div>
+        )}
 
         {/* Logout */}
         <div style={{ padding: 8, borderTop: `1px solid ${theme.border}` }}>
@@ -1021,6 +1260,19 @@ export default function OutlookScraper() {
                 </div>
               )}
             </div>
+
+            {/* Cache banner */}
+            {emailsFromCache && emails.length > 0 && (
+              <div style={{
+                padding: "8px 20px", background: "#f59e0b18",
+                borderBottom: `1px solid #f59e0b40`,
+                display: "flex", alignItems: "center", gap: 8,
+                fontSize: 12, color: "#f59e0b",
+              }}>
+                <span style={{ fontSize: 14 }}>&#9888;</span>
+                Showing cached emails — IMAP reconnecting...
+              </div>
+            )}
 
             <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
               {/* Email List */}
@@ -1544,13 +1796,19 @@ export default function OutlookScraper() {
                               animation: "fadeIn 0.2s ease",
                             }}>
                               {/* Body Preview */}
-                              {preview && (
-                                <div style={{
-                                  padding: "12px 14px", margin: "12px 0", borderRadius: 6,
-                                  background: theme.bg, fontSize: 11, color: theme.textMuted,
-                                  lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
-                                }}>
-                                  {preview}{bodyText.length > 500 ? "..." : ""}
+                              {em.body && (
+                                <div style={{ margin: "12px 0", borderRadius: 6, overflow: "hidden" }}>
+                                  {em.body_type === "html" ? (
+                                    <SafeEmailBody html={em.body} />
+                                  ) : (
+                                    <div style={{
+                                      padding: "12px 14px", borderRadius: 6,
+                                      background: theme.bg, fontSize: 11, color: theme.textMuted,
+                                      lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                                    }}>
+                                      {preview}{bodyText.length > 500 ? "..." : ""}
+                                    </div>
+                                  )}
                                 </div>
                               )}
 
@@ -1886,7 +2144,18 @@ export default function OutlookScraper() {
           </div>
         )}
         {/* ─── Candidates View ─────────────────────────────────────── */}
-        {view === "candidates" && (
+        {view === "candidates" && (() => {
+          const dupCount = candidates.filter((c) => c.is_duplicate || c.duplicate_group_id).length;
+          const displayed = showDuplicatesOnly
+            ? candidates.filter((c) => c.duplicate_group_id != null)
+            : candidates;
+          const allTags = [...new Set(candidates.flatMap((c) => c.tags || []))];
+          const TAG_COLORS = {
+            "shortlisted": "#22c55e", "rejected": "#ef4444", "on hold": "#f59e0b",
+            "interview scheduled": "#3b82f6", "offer sent": "#8b5cf6",
+          };
+          const getTagColor = (tag) => TAG_COLORS[tag.toLowerCase()] || theme.accent;
+          return (
           <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
             <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
               Candidates
@@ -1895,39 +2164,83 @@ export default function OutlookScraper() {
               Browse all extracted candidates from scraped email attachments.
             </p>
 
-            {/* Search Bar */}
-            <div style={{ marginBottom: 20, maxWidth: 400 }}>
+            {/* Search + Filters */}
+            <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 20, flexWrap: "wrap" }}>
               <input
                 type="text"
                 placeholder="Search by name or skill..."
                 value={candidateSearch}
                 onChange={(e) => setCandidateSearch(e.target.value)}
                 style={{
-                  width: "100%", padding: "8px 14px", borderRadius: 6,
+                  flex: 1, minWidth: 200, maxWidth: 400, padding: "8px 14px", borderRadius: 6,
                   background: theme.surface, border: `1px solid ${theme.border}`,
                   color: theme.text, fontSize: 12, outline: "none",
                 }}
                 onFocus={(e) => e.target.style.borderColor = theme.accent}
                 onBlur={(e) => e.target.style.borderColor = theme.border}
               />
+              <select
+                value={tagFilter}
+                onChange={(e) => { setTagFilter(e.target.value); loadCandidates(candidateSearch, e.target.value); }}
+                style={{
+                  padding: "8px 12px", borderRadius: 6, fontSize: 11,
+                  background: theme.surface, border: `1px solid ${tagFilter ? theme.accent : theme.border}`,
+                  color: tagFilter ? theme.accent : theme.textMuted, outline: "none", cursor: "pointer",
+                }}
+              >
+                <option value="">All Tags</option>
+                {[...new Set([...SUGGESTED_TAGS, ...allTags])].map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => setShowDuplicatesOnly(!showDuplicatesOnly)}
+                style={{
+                  padding: "8px 14px", borderRadius: 6, fontSize: 11, fontWeight: 500,
+                  cursor: "pointer", transition: "all 0.15s",
+                  background: showDuplicatesOnly ? `${theme.warning}20` : "transparent",
+                  color: showDuplicatesOnly ? theme.warning : theme.textMuted,
+                  border: `1px solid ${showDuplicatesOnly ? theme.warning : theme.border}`,
+                }}
+              >
+                Show Duplicates Only{dupCount > 0 ? ` (${dupCount})` : ""}
+              </button>
             </div>
 
             <span style={{ fontSize: 11, color: theme.textDim, marginBottom: 12, display: "block" }}>
-              {candidates.length} candidate{candidates.length !== 1 ? "s" : ""}
+              {displayed.length} candidate{displayed.length !== 1 ? "s" : ""}
+              {showDuplicatesOnly ? " (filtered)" : ""}{tagFilter ? ` — tag: "${tagFilter}"` : ""}
             </span>
 
             {/* Table */}
-            {candidates.length === 0 ? (
+            {displayed.length === 0 ? (
               <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
-                No candidates found. Scrape emails with resume attachments to populate.
+                {showDuplicatesOnly
+                  ? "No duplicate candidates found."
+                  : tagFilter
+                    ? `No candidates with tag "${tagFilter}".`
+                    : (
+                      <div>
+                        <div style={{ marginBottom: 12 }}>No candidates yet — go to Scrape & Export to scan your inbox</div>
+                        <button
+                          onClick={() => { setView("scrape"); setSelectedEmail(null); }}
+                          style={{
+                            padding: "8px 20px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                            background: theme.accent, color: "#fff", border: "none", cursor: "pointer",
+                          }}
+                        >
+                          Go to Scrape & Export
+                        </button>
+                      </div>
+                    )}
               </div>
             ) : (
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                   <thead>
                     <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
-                      {["Name", "Email", "Phone", "Skills", "Experience", "Location", "Source UID"].map((h) => (
-                        <th key={h} style={{
+                      {["Name", "Email", "Phone", "Skills", "Tags", "Exp", "Location", ""].map((h) => (
+                        <th key={h || "actions"} style={{
                           padding: "8px 12px", textAlign: "left", fontSize: 10,
                           color: theme.textDim, fontWeight: 600, textTransform: "uppercase",
                           letterSpacing: 0.5, whiteSpace: "nowrap",
@@ -1938,9 +2251,32 @@ export default function OutlookScraper() {
                     </tr>
                   </thead>
                   <tbody>
-                    {candidates.map((c) => (
-                      <tr key={c.id} style={{ borderBottom: `1px solid ${theme.border}` }}>
-                        <td style={{ padding: "10px 12px", fontWeight: 500 }}>{c.name}</td>
+                    {displayed.map((c) => (
+                      <React.Fragment key={c.id}>
+                      <tr
+                        onClick={() => setExpandedCandidateId(expandedCandidateId === c.id ? null : c.id)}
+                        style={{
+                          borderBottom: expandedCandidateId === c.id ? "none" : `1px solid ${theme.border}`,
+                          borderLeft: c.duplicate_group_id != null
+                            ? `3px solid ${c.is_duplicate ? theme.warning : theme.success}`
+                            : "3px solid transparent",
+                          cursor: "pointer", transition: "background 0.1s",
+                        }}
+                        onMouseEnter={(e) => e.currentTarget.style.background = `${theme.accent}08`}
+                        onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                      >
+                        <td style={{ padding: "10px 12px", fontWeight: 500 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontSize: 10, color: theme.textDim, marginRight: 2 }}>
+                              {expandedCandidateId === c.id ? "\u25BC" : "\u25B6"}
+                            </span>
+                            {c.name}
+                            {c.is_duplicate && <Badge color={theme.warning}>DUPLICATE</Badge>}
+                            {c.duplicate_group_id != null && !c.is_duplicate && (
+                              <Badge color={theme.success}>ORIGINAL</Badge>
+                            )}
+                          </div>
+                        </td>
                         <td style={{ padding: "10px 12px", color: theme.accent }}>{c.email || "\u2014"}</td>
                         <td style={{ padding: "10px 12px", color: theme.textMuted }}>{c.phone || "\u2014"}</td>
                         <td style={{ padding: "10px 12px", maxWidth: 200 }}>
@@ -1953,24 +2289,565 @@ export default function OutlookScraper() {
                             )}
                           </div>
                         </td>
+                        <td style={{ padding: "10px 12px", maxWidth: 180 }}>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                            {(c.tags || []).slice(0, 3).map((t, i) => (
+                              <span key={i} style={{
+                                padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 600,
+                                background: `${getTagColor(t)}20`, color: getTagColor(t),
+                                border: `1px solid ${getTagColor(t)}40`,
+                              }}>{t}</span>
+                            ))}
+                            {(c.tags || []).length > 3 && (
+                              <span style={{ fontSize: 10, color: theme.textDim }}>+{c.tags.length - 3}</span>
+                            )}
+                          </div>
+                        </td>
                         <td style={{ padding: "10px 12px", color: theme.textMuted }}>
                           {c.years_exp != null ? `${c.years_exp}y` : "\u2014"}
                         </td>
                         <td style={{ padding: "10px 12px", color: theme.textMuted }}>{c.location || "\u2014"}</td>
-                        <td style={{
-                          padding: "10px 12px", fontSize: 10, color: theme.textDim,
-                          maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                        }}>
-                          {c.source_email_uid || "\u2014"}
+                        <td style={{ padding: "10px 12px" }}>
+                          {c.is_duplicate && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); deleteCandidate(c.id); }}
+                              style={{
+                                padding: "4px 10px", borderRadius: 4, fontSize: 10,
+                                background: `${theme.danger}15`, border: `1px solid ${theme.danger}40`,
+                                color: theme.danger, cursor: "pointer", fontWeight: 600,
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              Merge (Remove)
+                            </button>
+                          )}
                         </td>
                       </tr>
+                      {/* Expanded detail panel */}
+                      {expandedCandidateId === c.id && (
+                        <tr style={{
+                          borderBottom: `1px solid ${theme.border}`,
+                          borderLeft: c.duplicate_group_id != null
+                            ? `3px solid ${c.is_duplicate ? theme.warning : theme.success}`
+                            : "3px solid transparent",
+                        }}>
+                          <td colSpan={8} style={{ padding: "0 12px 16px 32px" }}>
+                            <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                              {/* Tags Section */}
+                              <div style={{ flex: "1 1 320px", minWidth: 280 }}>
+                                <label style={{
+                                  fontSize: 10, color: theme.textDim, fontWeight: 600,
+                                  textTransform: "uppercase", letterSpacing: 0.5,
+                                  display: "block", marginBottom: 8,
+                                }}>Tags</label>
+                                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                                  {(c.tags || []).map((t, i) => (
+                                    <span key={i} style={{
+                                      display: "inline-flex", alignItems: "center", gap: 4,
+                                      padding: "3px 10px", borderRadius: 12, fontSize: 11, fontWeight: 600,
+                                      background: `${getTagColor(t)}20`, color: getTagColor(t),
+                                      border: `1px solid ${getTagColor(t)}40`,
+                                    }}>
+                                      {t}
+                                      <span
+                                        onClick={(e) => { e.stopPropagation(); removeTagFromCandidate(c.id, t); }}
+                                        style={{ cursor: "pointer", fontSize: 13, lineHeight: 1, marginLeft: 2, opacity: 0.7 }}
+                                        title="Remove tag"
+                                      >&times;</span>
+                                    </span>
+                                  ))}
+                                </div>
+                                {/* Tag input */}
+                                <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                                  <input
+                                    type="text"
+                                    placeholder="Add tag..."
+                                    value={candidateTagInput[c.id] || ""}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onChange={(e) => setCandidateTagInput((p) => ({ ...p, [c.id]: e.target.value }))}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" && (candidateTagInput[c.id] || "").trim()) {
+                                        addTagToCandidate(c.id, candidateTagInput[c.id].trim());
+                                        setCandidateTagInput((p) => ({ ...p, [c.id]: "" }));
+                                      }
+                                    }}
+                                    style={{
+                                      padding: "5px 10px", borderRadius: 6, fontSize: 11, width: 140,
+                                      background: theme.bg, border: `1px solid ${theme.border}`,
+                                      color: theme.text, outline: "none",
+                                    }}
+                                  />
+                                  {/* Suggested tags */}
+                                  {SUGGESTED_TAGS.filter((st) => !(c.tags || []).some((t) => t.toLowerCase() === st.toLowerCase())).map((st) => (
+                                    <button
+                                      key={st}
+                                      onClick={(e) => { e.stopPropagation(); addTagToCandidate(c.id, st); }}
+                                      style={{
+                                        padding: "3px 8px", borderRadius: 10, fontSize: 10,
+                                        background: "transparent", border: `1px dashed ${theme.border}`,
+                                        color: theme.textDim, cursor: "pointer",
+                                      }}
+                                      title={`Add "${st}"`}
+                                    >+ {st}</button>
+                                  ))}
+                                </div>
+                              </div>
+                              {/* Notes Section */}
+                              <div style={{ flex: "1 1 320px", minWidth: 280 }}>
+                                <label style={{
+                                  fontSize: 10, color: theme.textDim, fontWeight: 600,
+                                  textTransform: "uppercase", letterSpacing: 0.5,
+                                  display: "block", marginBottom: 8,
+                                }}>Notes</label>
+                                <textarea
+                                  placeholder="Add recruiter notes..."
+                                  value={candidateNotesDraft[c.id] !== undefined ? candidateNotesDraft[c.id] : (c.notes || "")}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) => setCandidateNotesDraft((p) => ({ ...p, [c.id]: e.target.value }))}
+                                  onBlur={() => {
+                                    const draft = candidateNotesDraft[c.id];
+                                    if (draft !== undefined && draft !== (c.notes || "")) {
+                                      saveCandidateNotes(c.id, draft);
+                                    }
+                                    setCandidateNotesDraft((p) => { const n = { ...p }; delete n[c.id]; return n; });
+                                  }}
+                                  rows={3}
+                                  style={{
+                                    width: "100%", padding: "8px 12px", borderRadius: 6, fontSize: 12,
+                                    background: theme.bg, border: `1px solid ${theme.border}`,
+                                    color: theme.text, outline: "none", resize: "vertical",
+                                    fontFamily: "inherit",
+                                  }}
+                                />
+                                <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>
+                                  Auto-saves on blur
+                                </div>
+                              </div>
+                            </div>
+                            {/* Extra info + actions row */}
+                            <div style={{ marginTop: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <div style={{ fontSize: 11, color: theme.textDim }}>
+                                Source UID: {c.source_email_uid || "\u2014"} &nbsp;|&nbsp;
+                                Titles: {(c.titles || []).join(", ") || "\u2014"} &nbsp;|&nbsp;
+                                Added: {c.created_at ? new Date(c.created_at).toLocaleDateString() : "\u2014"}
+                              </div>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); openCandidateProfile(c.id); }}
+                                style={{
+                                  padding: "6px 16px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                                  background: theme.accent, color: "#fff", border: "none",
+                                  cursor: "pointer",
+                                }}
+                              >
+                                View Full Profile
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                     ))}
                   </tbody>
                 </table>
               </div>
             )}
           </div>
-        )}
+          );
+        })()}
+
+        {/* ─── Candidate Profile View ─────────────────────────────── */}
+        {view === "candidateProfile" && selectedCandidateId && (() => {
+          const p = candidateProfile;
+          // Use list data as fallback while full profile loads
+          const preview = p || candidates.find((x) => x.id === selectedCandidateId) || {};
+          const c = p || preview;
+          const TAG_COLORS = {
+            "shortlisted": "#22c55e", "rejected": "#ef4444", "on hold": "#f59e0b",
+            "interview scheduled": "#3b82f6", "offer sent": "#8b5cf6",
+          };
+          const getTagColor = (tag) => TAG_COLORS[tag.toLowerCase()] || theme.accent;
+          const bestMatch = (p?.match_history || []).length > 0 ? p.match_history[0] : null;
+          const fitColors = { high: "#22c55e", medium: "#f59e0b", low: "#ef4444" };
+          const copyToClipboard = (text) => { navigator.clipboard.writeText(text); notify("Copied to clipboard", "success"); };
+
+          return (
+          <div style={{ flex: 1, overflowY: "auto", padding: "24px 32px" }}>
+            {/* Top Header Bar */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+              <button
+                onClick={() => { setView("candidates"); setSelectedCandidateId(null); setCandidateProfile(null); setSelectedCandidate(null); }}
+                style={{
+                  padding: "6px 14px", borderRadius: 6, fontSize: 12, fontWeight: 500,
+                  background: "transparent", border: `1px solid ${theme.border}`,
+                  color: theme.textMuted, cursor: "pointer",
+                  display: "flex", alignItems: "center", gap: 6,
+                }}
+              >
+                ← Back
+              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, flex: 1, justifyContent: "center" }}>
+                <h2 style={{ fontSize: 20, fontWeight: 700, letterSpacing: -0.5, margin: 0 }}>{c.name || "Loading..."}</h2>
+                {bestMatch && (
+                  <span style={{
+                    padding: "3px 10px", borderRadius: 12, fontSize: 10, fontWeight: 700,
+                    background: `${fitColors[bestMatch.fit_level] || theme.textDim}20`,
+                    color: fitColors[bestMatch.fit_level] || theme.textDim,
+                    border: `1px solid ${fitColors[bestMatch.fit_level] || theme.textDim}40`,
+                    textTransform: "uppercase",
+                  }}>
+                    {bestMatch.fit_level} fit ({bestMatch.score}%)
+                  </span>
+                )}
+              </div>
+              {c.email && (
+                <a
+                  href={`mailto:${c.email}`}
+                  style={{
+                    padding: "7px 16px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                    background: theme.accent, color: "#fff", border: "none",
+                    cursor: "pointer", textDecoration: "none", whiteSpace: "nowrap",
+                  }}
+                >
+                  ✉ Send Email
+                </a>
+              )}
+            </div>
+
+            {/* Two Column Layout */}
+            <div style={{ display: "flex", gap: 24 }}>
+              {/* LEFT PANEL (35%) */}
+              <div style={{ width: "35%", flexShrink: 0, position: "sticky", top: 24, alignSelf: "flex-start" }}>
+                {/* Contact Card */}
+                <div style={{ padding: 16, borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>
+                    Contact
+                  </div>
+                  {c.email && (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ fontSize: 12, color: theme.accent, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{c.email}</span>
+                      <span onClick={() => copyToClipboard(c.email)} style={{ cursor: "pointer", fontSize: 13, opacity: 0.5, marginLeft: 8, flexShrink: 0 }} title="Copy email">📋</span>
+                    </div>
+                  )}
+                  {c.phone && (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ fontSize: 12, color: theme.text }}>{c.phone}</span>
+                      <span onClick={() => copyToClipboard(c.phone)} style={{ cursor: "pointer", fontSize: 13, opacity: 0.5, marginLeft: 8, flexShrink: 0 }} title="Copy phone">📋</span>
+                    </div>
+                  )}
+                  {c.location && (
+                    <div style={{ fontSize: 12, color: theme.textMuted }}>{c.location}</div>
+                  )}
+                  {!c.email && !c.phone && !c.location && (
+                    <div style={{ fontSize: 12, color: theme.textDim }}>No contact info</div>
+                  )}
+                </div>
+
+                {/* Skills */}
+                <div style={{ padding: 16, borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>
+                    Skills ({(c.skills || []).length})
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {(c.skills || []).length > 0 ? (c.skills || []).map((s, i) => (
+                      <span key={i} style={{
+                        padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 600,
+                        background: "rgba(20,184,166,0.15)", color: "#14b8a6",
+                        textTransform: "uppercase", letterSpacing: 0.3,
+                      }}>{s}</span>
+                    )) : <span style={{ fontSize: 11, color: theme.textDim }}>No skills extracted</span>}
+                  </div>
+                </div>
+
+                {/* Experience & Titles */}
+                <div style={{ padding: 16, borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>
+                    Experience
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+                    {c.years_exp != null ? `${c.years_exp} years` : "Not specified"}
+                  </div>
+                  {(c.titles || []).length > 0 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {(c.titles || []).map((t, i) => (
+                        <div key={i} style={{ fontSize: 11, color: theme.textMuted, paddingLeft: 8, borderLeft: `2px solid ${theme.border}` }}>{t}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Tags */}
+                <div style={{ padding: 16, borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>
+                    Tags
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 8 }}>
+                    {(c.tags || []).map((t, i) => (
+                      <span key={i} style={{
+                        display: "inline-flex", alignItems: "center", gap: 3,
+                        padding: "3px 10px", borderRadius: 12, fontSize: 11, fontWeight: 600,
+                        background: `${getTagColor(t)}20`, color: getTagColor(t),
+                        border: `1px solid ${getTagColor(t)}40`,
+                      }}>
+                        {t}
+                        <span
+                          onClick={() => {
+                            removeTagFromCandidate(c.id, t);
+                            setCandidateProfile((prev) => prev ? { ...prev, tags: (prev.tags || []).filter((x) => x !== t) } : prev);
+                            setSelectedCandidate((prev) => prev ? { ...prev, tags: (prev.tags || []).filter((x) => x !== t) } : prev);
+                          }}
+                          style={{ cursor: "pointer", fontSize: 13, lineHeight: 1, opacity: 0.7 }}
+                          title="Remove tag"
+                        >&times;</span>
+                      </span>
+                    ))}
+                  </div>
+                  {/* Suggested tags */}
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
+                    {SUGGESTED_TAGS.filter((st) => !(c.tags || []).some((t) => t.toLowerCase() === st.toLowerCase())).map((st) => (
+                      <button
+                        key={st}
+                        onClick={() => {
+                          addTagToCandidate(c.id, st);
+                          setCandidateProfile((prev) => prev ? { ...prev, tags: [...(prev.tags || []), st] } : prev);
+                          setSelectedCandidate((prev) => prev ? { ...prev, tags: [...(prev.tags || []), st] } : prev);
+                        }}
+                        style={{
+                          padding: "3px 8px", borderRadius: 10, fontSize: 10,
+                          background: "transparent", border: `1px dashed ${theme.border}`,
+                          color: theme.textDim, cursor: "pointer",
+                        }}
+                      >+ {st}</button>
+                    ))}
+                  </div>
+                  {/* Custom tag input */}
+                  <input
+                    type="text"
+                    placeholder="Custom tag + Enter"
+                    value={candidateTagInput[c.id] || ""}
+                    onChange={(e) => setCandidateTagInput((pr) => ({ ...pr, [c.id]: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (candidateTagInput[c.id] || "").trim()) {
+                        const newTag = candidateTagInput[c.id].trim();
+                        addTagToCandidate(c.id, newTag);
+                        setCandidateProfile((prev) => {
+                          if (!prev) return prev;
+                          const cur = prev.tags || [];
+                          if (cur.some((t) => t.toLowerCase() === newTag.toLowerCase())) return prev;
+                          return { ...prev, tags: [...cur, newTag] };
+                        });
+                        setSelectedCandidate((prev) => {
+                          if (!prev) return prev;
+                          const cur = prev.tags || [];
+                          if (cur.some((t) => t.toLowerCase() === newTag.toLowerCase())) return prev;
+                          return { ...prev, tags: [...cur, newTag] };
+                        });
+                        setCandidateTagInput((pr) => ({ ...pr, [c.id]: "" }));
+                      }
+                    }}
+                    style={{
+                      padding: "5px 10px", borderRadius: 6, fontSize: 11, width: "100%",
+                      background: theme.bg, border: `1px solid ${theme.border}`,
+                      color: theme.text, outline: "none", boxSizing: "border-box",
+                    }}
+                  />
+                </div>
+
+                {/* Notes */}
+                <div style={{ padding: 16, borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}` }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                    <span style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      Notes
+                    </span>
+                    {profileNotesSaved && <span style={{ fontSize: 10, color: theme.success, fontWeight: 600 }}>✓ Saved</span>}
+                  </div>
+                  <textarea
+                    placeholder="Add recruiter notes..."
+                    value={candidateNotesDraft[c.id] !== undefined ? candidateNotesDraft[c.id] : (c.notes || "")}
+                    onChange={(e) => setCandidateNotesDraft((pr) => ({ ...pr, [c.id]: e.target.value }))}
+                    onBlur={() => {
+                      const draft = candidateNotesDraft[c.id];
+                      if (draft !== undefined && draft !== (c.notes || "")) {
+                        saveCandidateNotes(c.id, draft);
+                        setCandidateProfile((prev) => prev ? { ...prev, notes: draft } : prev);
+                        setSelectedCandidate((prev) => prev ? { ...prev, notes: draft } : prev);
+                        setProfileNotesSaved(true);
+                        setTimeout(() => setProfileNotesSaved(false), 2000);
+                      }
+                      setCandidateNotesDraft((pr) => { const n = { ...pr }; delete n[c.id]; return n; });
+                    }}
+                    rows={4}
+                    style={{
+                      width: "100%", padding: "8px 12px", borderRadius: 8, fontSize: 12,
+                      background: theme.bg, border: `1px solid ${theme.border}`,
+                      color: theme.text, outline: "none", resize: "vertical",
+                      fontFamily: "inherit", lineHeight: 1.5, boxSizing: "border-box",
+                    }}
+                  />
+                  <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>Auto-saves on blur</div>
+                </div>
+              </div>
+
+              {/* RIGHT PANEL (65%) */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {/* Tab buttons */}
+                <div style={{ display: "flex", gap: 4, marginBottom: 16, borderBottom: `1px solid ${theme.border}`, paddingBottom: 0 }}>
+                  {[
+                    { id: "resume", label: "Resume" },
+                    { id: "matches", label: "Match History" },
+                    { id: "email", label: "Source Email" },
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      onClick={() => setProfileActiveTab(tab.id)}
+                      style={{
+                        padding: "8px 16px", borderRadius: "6px 6px 0 0", fontSize: 12, fontWeight: 600,
+                        background: profileActiveTab === tab.id ? theme.surface : "transparent",
+                        border: profileActiveTab === tab.id ? `1px solid ${theme.border}` : "1px solid transparent",
+                        borderBottom: profileActiveTab === tab.id ? `1px solid ${theme.surface}` : "1px solid transparent",
+                        color: profileActiveTab === tab.id ? theme.text : theme.textDim,
+                        cursor: "pointer", marginBottom: -1,
+                      }}
+                    >{tab.label}</button>
+                  ))}
+                </div>
+
+                {/* Loading state */}
+                {profileLoading && (
+                  <div style={{
+                    padding: 40, textAlign: "center", borderRadius: 10,
+                    background: theme.surface, border: `1px solid ${theme.border}`,
+                  }}>
+                    <div style={{ fontSize: 13, color: theme.textDim, animation: "pulse 1.5s infinite" }}>Loading profile data...</div>
+                  </div>
+                )}
+
+                {/* Resume tab */}
+                {!profileLoading && profileActiveTab === "resume" && (
+                  <div style={{ borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, overflow: "hidden" }}>
+                    {p?.resume_text ? (
+                      <pre style={{
+                        padding: 20, margin: 0, maxHeight: 600, overflowY: "auto",
+                        fontSize: 12, lineHeight: 1.6, color: theme.text,
+                        fontFamily: "'Consolas', 'Monaco', 'Courier New', monospace",
+                        whiteSpace: "pre-wrap", wordBreak: "break-word",
+                        background: theme.surface,
+                      }}>
+                        {p.resume_text}
+                      </pre>
+                    ) : (
+                      <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                        {p ? "No resume text available" : "Loading..."}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Match History tab */}
+                {!profileLoading && profileActiveTab === "matches" && (
+                  <div style={{ borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, overflow: "hidden" }}>
+                    {(p?.match_history || []).length > 0 ? (
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead>
+                          <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                            {["#", "Job Title", "Score", "Fit Level", "Date"].map((h) => (
+                              <th key={h} style={{
+                                padding: "10px 14px", textAlign: "left", fontSize: 10,
+                                color: theme.textDim, fontWeight: 600, textTransform: "uppercase",
+                                letterSpacing: 0.5,
+                              }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {p.match_history.map((m, i) => (
+                            <React.Fragment key={i}>
+                              <tr
+                                onClick={() => setExpandedMatchIdx(expandedMatchIdx === i ? null : i)}
+                                style={{
+                                  borderBottom: `1px solid ${theme.border}`, cursor: "pointer",
+                                  background: expandedMatchIdx === i ? theme.bg : "transparent",
+                                }}
+                              >
+                                <td style={{ padding: "10px 14px", color: theme.textDim }}>{i + 1}</td>
+                                <td style={{ padding: "10px 14px", fontWeight: 600 }}>{m.job_title}</td>
+                                <td style={{ padding: "10px 14px" }}>
+                                  <span style={{
+                                    padding: "2px 8px", borderRadius: 4, fontSize: 11, fontWeight: 700,
+                                    background: `${fitColors[m.fit_level] || theme.textDim}20`,
+                                    color: fitColors[m.fit_level] || theme.textDim,
+                                  }}>{m.score}%</span>
+                                </td>
+                                <td style={{ padding: "10px 14px", color: fitColors[m.fit_level] || theme.textDim, fontWeight: 600, textTransform: "capitalize" }}>
+                                  {m.fit_level}
+                                </td>
+                                <td style={{ padding: "10px 14px", color: theme.textDim }}>
+                                  {m.matched_at ? new Date(m.matched_at).toLocaleDateString() : "\u2014"}
+                                </td>
+                              </tr>
+                              {expandedMatchIdx === i && (
+                                <tr>
+                                  <td colSpan={5} style={{ padding: "12px 14px 16px 42px", background: theme.bg }}>
+                                    <div style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+                                      Match Reasons
+                                    </div>
+                                    <ul style={{ margin: 0, paddingLeft: 16, listStyle: "disc" }}>
+                                      {(m.match_reasons || []).map((r, ri) => (
+                                        <li key={ri} style={{ fontSize: 11, color: theme.textMuted, lineHeight: 1.8 }}>{r}</li>
+                                      ))}
+                                    </ul>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                        {p ? "No match runs yet \u2014 go to Jobs & Match to run matching" : "Loading..."}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Source Email tab */}
+                {!profileLoading && profileActiveTab === "email" && (
+                  <div style={{ borderRadius: 10, background: theme.surface, border: `1px solid ${theme.border}`, overflow: "hidden" }}>
+                    {p?.source_email ? (
+                      <div style={{ padding: 20 }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "80px 1fr", gap: "8px 12px", marginBottom: 16 }}>
+                          <span style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", paddingTop: 2 }}>Subject</span>
+                          <span style={{ fontSize: 13, fontWeight: 600 }}>{p.source_email.subject || "(No Subject)"}</span>
+                          <span style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", paddingTop: 2 }}>From</span>
+                          <span style={{ fontSize: 12, color: theme.textMuted }}>
+                            {p.source_email.sender || "Unknown"} {p.source_email.sender_email && <span style={{ color: theme.accent }}>&lt;{p.source_email.sender_email}&gt;</span>}
+                          </span>
+                          <span style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", paddingTop: 2 }}>Date</span>
+                          <span style={{ fontSize: 12, color: theme.textMuted }}>
+                            {p.source_email.date ? new Date(p.source_email.date).toLocaleString() : "\u2014"}
+                          </span>
+                        </div>
+                        <div style={{
+                          maxHeight: 400, overflowY: "auto", padding: 16, borderRadius: 8,
+                          background: theme.bg, border: `1px solid ${theme.border}`,
+                          fontSize: 12, lineHeight: 1.6, color: theme.textMuted,
+                          whiteSpace: "pre-wrap", wordBreak: "break-word",
+                        }}>
+                          {p.source_email.body_text || "(No body text)"}
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                        {p ? "Source email not available" : "Loading..."}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+          );
+        })()}
 
         {/* ─── Jobs & Match View ───────────────────────────────────── */}
         {view === "jobs" && (
@@ -2001,11 +2878,39 @@ export default function OutlookScraper() {
                   />
                 </div>
                 <div>
-                  <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
-                    Job Description
-                  </label>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                    <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      Job Description
+                    </label>
+                    <label style={{
+                      fontSize: 10, fontWeight: 600, color: theme.accent,
+                      cursor: jdUploading ? "not-allowed" : "pointer",
+                      opacity: jdUploading ? 0.5 : 1,
+                      display: "flex", alignItems: "center", gap: 4,
+                    }}>
+                      {jdUploading ? (
+                        <><span style={{
+                          display: "inline-block", width: 10, height: 10,
+                          border: `2px solid ${theme.border}`, borderTopColor: theme.accent,
+                          borderRadius: "50%", animation: "spin 0.8s linear infinite",
+                        }} /> Parsing...</>
+                      ) : (
+                        <>&#8593; Upload PDF/DOCX</>
+                      )}
+                      <input
+                        type="file"
+                        accept=".pdf,.docx,.doc"
+                        disabled={jdUploading}
+                        style={{ display: "none" }}
+                        onChange={(e) => {
+                          if (e.target.files[0]) uploadJD(e.target.files[0]);
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                  </div>
                   <textarea
-                    placeholder="Paste the full JD text here..."
+                    placeholder="Paste the full JD text here or upload a file..."
                     value={jobForm.jd_raw}
                     onChange={(e) => setJobForm({ ...jobForm, jd_raw: e.target.value })}
                     rows={4}
@@ -2274,6 +3179,530 @@ export default function OutlookScraper() {
               >
                 Download CSV
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* ─── Settings View ──────────────────────────────────────── */}
+        {view === "settings" && (() => {
+          const h = storageHealth;
+          const timeAgo = (iso) => {
+            if (!iso) return "Never";
+            const diff = Date.now() - new Date(iso).getTime();
+            const mins = Math.floor(diff / 60000);
+            if (mins < 1) return "Just now";
+            if (mins < 60) return `${mins}m ago`;
+            const hrs = Math.floor(mins / 60);
+            if (hrs < 24) return `${hrs}h ago`;
+            return `${Math.floor(hrs / 24)}d ago`;
+          };
+          const statusColor = h?.health_status === "healthy" ? "#22c55e"
+            : h?.health_status === "warning" ? "#f59e0b" : "#ef4444";
+          const statusLabel = h?.health_status === "healthy" ? "Healthy"
+            : h?.health_status === "warning" ? "Warning" : "Empty";
+          const typeColors = { pdf: "#ef4444", docx: "#3b82f6", doc: "#60a5fa", image: "#22c55e", other: "#6b7280" };
+
+          return (
+          <div style={{ flex: 1, overflowY: "auto", padding: 24, maxWidth: 900, margin: "0 auto" }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>Settings</h2>
+            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 24 }}>Storage health, sync status, and data management.</p>
+
+            {/* ─── Auto-Scrape Scheduler Section ──────────────────── */}
+            {(() => {
+              const sc = schedulerConfig;
+              const isEnabled = sc?.enabled || false;
+              const isRunning = sc?.is_running || false;
+              const formatCountdown = (secs) => {
+                if (secs == null || secs <= 0) return "0s";
+                const m = Math.floor(secs / 60);
+                const s = secs % 60;
+                return m > 0 ? `${m}m ${s}s` : `${s}s`;
+              };
+              const INTERVAL_OPTIONS = [
+                { value: 15, label: "Every 15 mins" },
+                { value: 30, label: "Every 30 mins" },
+                { value: 60, label: "Every hour" },
+                { value: 120, label: "Every 2 hours" },
+                { value: 360, label: "Every 6 hours" },
+              ];
+              return (
+              <div style={{
+                background: theme.surface,
+                border: `1px solid ${theme.border}`,
+                borderLeft: `3px solid ${isEnabled ? "#22c55e" : theme.textDim}`,
+                borderRadius: 12, overflow: "hidden", marginBottom: 20,
+              }}>
+                {/* Top row: title + toggle */}
+                <div style={{
+                  padding: "16px 20px", borderBottom: `1px solid ${theme.border}`,
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{
+                      width: 8, height: 8, borderRadius: "50%",
+                      background: isEnabled && isRunning ? "#22c55e" : theme.textDim,
+                      boxShadow: isEnabled && isRunning ? "0 0 6px #22c55e" : "none",
+                      display: "inline-block",
+                    }} />
+                    <span style={{ fontSize: 15, fontWeight: 700 }}>Auto-Scrape Scheduler</span>
+                  </div>
+                  {/* Toggle switch */}
+                  <div
+                    onClick={async () => {
+                      if (schedulerLoading) return;
+                      setSchedulerLoading(true);
+                      try {
+                        const res = await fetch(`${API}/api/scheduler/config`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            enabled: !isEnabled,
+                            interval_minutes: schedulerForm.interval_minutes,
+                            folder: schedulerForm.folder || "INBOX",
+                            subject_filter: schedulerForm.subject_filter || null,
+                          }),
+                        });
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        notify(isEnabled ? "Scheduler disabled" : "Scheduler enabled", "success");
+                        await loadSchedulerConfig();
+                      } catch (e) {
+                        notify("Failed to toggle scheduler", "error");
+                      } finally {
+                        setSchedulerLoading(false);
+                      }
+                    }}
+                    style={{
+                      width: 42, height: 22, borderRadius: 11, cursor: "pointer",
+                      background: isEnabled ? "#22c55e" : theme.textDim,
+                      position: "relative", transition: "background 0.2s",
+                    }}
+                  >
+                    <div style={{
+                      width: 16, height: 16, borderRadius: "50%", background: "#fff",
+                      position: "absolute", top: 3,
+                      left: isEnabled ? 23 : 3,
+                      transition: "left 0.2s",
+                    }} />
+                  </div>
+                </div>
+
+                {/* Settings form — visible when enabled */}
+                {isEnabled && (
+                  <div style={{ padding: "16px 20px", borderBottom: `1px solid ${theme.border}` }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+                      <div>
+                        <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          Interval
+                        </label>
+                        <select
+                          value={schedulerForm.interval_minutes}
+                          onChange={(e) => setSchedulerForm((p) => ({ ...p, interval_minutes: parseInt(e.target.value) }))}
+                          style={{
+                            width: "100%", padding: "7px 10px", borderRadius: 6, fontSize: 12,
+                            background: theme.bg, border: `1px solid ${theme.border}`,
+                            color: theme.text, outline: "none",
+                          }}
+                        >
+                          {INTERVAL_OPTIONS.map((o) => (
+                            <option key={o.value} value={o.value}>{o.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          Folder
+                        </label>
+                        <input
+                          type="text"
+                          value={schedulerForm.folder}
+                          onChange={(e) => setSchedulerForm((p) => ({ ...p, folder: e.target.value }))}
+                          placeholder="INBOX"
+                          style={{
+                            width: "100%", padding: "7px 10px", borderRadius: 6, fontSize: 12,
+                            background: theme.bg, border: `1px solid ${theme.border}`,
+                            color: theme.text, outline: "none", boxSizing: "border-box",
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div style={{ marginBottom: 14 }}>
+                      <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                        Subject Filter
+                      </label>
+                      <input
+                        type="text"
+                        value={schedulerForm.subject_filter}
+                        onChange={(e) => setSchedulerForm((p) => ({ ...p, subject_filter: e.target.value }))}
+                        placeholder="Optional keyword e.g. Candidate"
+                        style={{
+                          width: "100%", padding: "7px 10px", borderRadius: 6, fontSize: 12,
+                          background: theme.bg, border: `1px solid ${theme.border}`,
+                          color: theme.text, outline: "none", boxSizing: "border-box",
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: "flex", gap: 10 }}>
+                      <button
+                        onClick={async () => {
+                          setSchedulerLoading(true);
+                          try {
+                            const res = await fetch(`${API}/api/scheduler/config`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({
+                                enabled: true,
+                                interval_minutes: schedulerForm.interval_minutes,
+                                folder: schedulerForm.folder || "INBOX",
+                                subject_filter: schedulerForm.subject_filter || null,
+                              }),
+                            });
+                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                            notify("Scheduler settings saved", "success");
+                            await loadSchedulerConfig();
+                          } catch (e) {
+                            notify("Failed to save settings", "error");
+                          } finally {
+                            setSchedulerLoading(false);
+                          }
+                        }}
+                        disabled={schedulerLoading}
+                        style={{
+                          padding: "7px 16px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                          background: theme.accent, color: "#fff", border: "none",
+                          cursor: schedulerLoading ? "not-allowed" : "pointer",
+                          opacity: schedulerLoading ? 0.6 : 1,
+                        }}
+                      >Save Settings</button>
+                      <button
+                        onClick={async () => {
+                          setSchedulerRunNow(true);
+                          try {
+                            const res = await fetch(`${API}/api/scheduler/run-now`, { method: "POST" });
+                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                            notify("Scrape started", "success");
+                          } catch (e) {
+                            notify("Failed to start scrape", "error");
+                          }
+                          setTimeout(async () => {
+                            setSchedulerRunNow(false);
+                            await loadSchedulerConfig();
+                          }, 3000);
+                        }}
+                        disabled={schedulerRunNow}
+                        style={{
+                          padding: "7px 16px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                          background: "transparent", border: `1px solid ${theme.border}`,
+                          color: schedulerRunNow ? theme.success : theme.textMuted,
+                          cursor: schedulerRunNow ? "not-allowed" : "pointer",
+                        }}
+                      >{schedulerRunNow ? "Running..." : "▶ Run Now"}</button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Status row */}
+                <div style={{ padding: "12px 20px", fontSize: 12, color: theme.textMuted, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                  {sc?.last_run_at ? (
+                    <span>
+                      Last run: {(() => {
+                        const diff = Date.now() - new Date(sc.last_run_at).getTime();
+                        const mins = Math.floor(diff / 60000);
+                        if (mins < 1) return "Just now";
+                        if (mins < 60) return `${mins}m ago`;
+                        const hrs = Math.floor(mins / 60);
+                        if (hrs < 24) return `${hrs}h ago`;
+                        return `${Math.floor(hrs / 24)}d ago`;
+                      })()} · Found {sc.emails_found_last_run} emails · {sc.candidates_added_last_run} new candidates
+                    </span>
+                  ) : (
+                    <span style={{ color: theme.textDim }}>Not run yet</span>
+                  )}
+                  {isEnabled && schedulerCountdown != null && schedulerCountdown > 0 && (
+                    <span style={{ color: theme.accent, fontWeight: 600 }}>
+                      Next run in: {formatCountdown(schedulerCountdown)}
+                    </span>
+                  )}
+                </div>
+              </div>
+              );
+            })()}
+
+            {!h ? (
+              <Spinner />
+            ) : (
+              <div style={{
+                background: theme.surface, border: `1px solid ${theme.border}`,
+                borderRadius: 12, overflow: "hidden",
+              }}>
+                {/* Header */}
+                <div style={{
+                  padding: "16px 20px", borderBottom: `1px solid ${theme.border}`,
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontSize: 18 }}>💾</span>
+                    <span style={{ fontSize: 15, fontWeight: 700 }}>Storage Health</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{
+                      padding: "3px 10px", borderRadius: 12, fontSize: 11, fontWeight: 700,
+                      background: `${statusColor}20`, color: statusColor,
+                      border: `1px solid ${statusColor}40`,
+                    }}>{statusLabel}</span>
+                    <button
+                      onClick={loadStorageHealth}
+                      title="Refresh"
+                      style={{
+                        width: 30, height: 30, borderRadius: "50%", border: `1px solid ${theme.border}`,
+                        background: "transparent", color: theme.textMuted, cursor: "pointer",
+                        display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14,
+                      }}
+                    >↻</button>
+                  </div>
+                </div>
+
+                {/* Database Section */}
+                <div style={{ padding: "16px 20px", borderBottom: `1px solid ${theme.border}` }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>
+                    Database
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 12 }}>
+                    {[
+                      { icon: "📁", label: "Database Size", value: h.database.db_size_human },
+                      { icon: "👤", label: "Candidates", value: h.record_counts.candidates },
+                      { icon: "📧", label: "Emails Scraped", value: h.record_counts.scraped_emails },
+                      { icon: "💼", label: "Jobs Created", value: h.record_counts.jobs },
+                      { icon: "🎯", label: "Match Results", value: h.record_counts.match_results },
+                      { icon: "📝", label: "With Notes", value: h.record_counts.notes_count },
+                      { icon: "🏷️", label: "Tagged", value: h.record_counts.tagged_count },
+                    ].map((s) => (
+                      <div key={s.label} style={{
+                        padding: "10px 12px", borderRadius: 8, background: theme.bg,
+                        border: `1px solid ${theme.border}`,
+                      }}>
+                        <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>
+                          {s.icon} {s.label}
+                        </div>
+                        <div style={{ fontSize: 18, fontWeight: 700 }}>{s.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Attachments Section */}
+                <div style={{ padding: "16px 20px", borderBottom: `1px solid ${theme.border}` }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>
+                    Attachments
+                  </div>
+                  <div style={{ display: "flex", gap: 20, marginBottom: 14 }}>
+                    <div style={{ padding: "10px 12px", borderRadius: 8, background: theme.bg, border: `1px solid ${theme.border}`, flex: 1 }}>
+                      <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>📎 Total Files</div>
+                      <div style={{ fontSize: 18, fontWeight: 700 }}>{h.attachments.total_files}</div>
+                    </div>
+                    <div style={{ padding: "10px 12px", borderRadius: 8, background: theme.bg, border: `1px solid ${theme.border}`, flex: 1 }}>
+                      <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>💿 Storage Used</div>
+                      <div style={{ fontSize: 18, fontWeight: 700 }}>{h.attachments.total_size_human}</div>
+                    </div>
+                  </div>
+                  {/* Type breakdown bar */}
+                  {h.attachments.total_files > 0 && (() => {
+                    const types = h.attachments.by_type;
+                    const segments = Object.entries(types).sort((a, b) => b[1] - a[1]);
+                    return (
+                      <div>
+                        <div style={{ display: "flex", width: "100%", height: 10, borderRadius: 6, overflow: "hidden", marginBottom: 8 }}>
+                          {segments.map(([type, count]) => (
+                            <div key={type} style={{
+                              flex: count,
+                              background: typeColors[type] || typeColors.other,
+                            }} />
+                          ))}
+                        </div>
+                        <div style={{ fontSize: 11, color: theme.textDim }}>
+                          {segments.filter(([, c]) => c > 0).map(([type, count]) => `${count} ${type.toUpperCase()}`).join(" · ")}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* Sync Status Section */}
+                <div style={{ padding: "16px 20px", borderBottom: `1px solid ${theme.border}` }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: theme.textDim, textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>
+                    Sync Status
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    {[
+                      { icon: "🕐", label: "Last Email Scraped", value: timeAgo(h.sync.last_scraped_at) },
+                      { icon: "👤", label: "Last Candidate Added", value: timeAgo(h.sync.last_candidate_added) },
+                      { icon: "🎯", label: "Last Match Run", value: timeAgo(h.sync.last_match_run) },
+                    ].map((s) => (
+                      <div key={s.label} style={{
+                        padding: "10px 12px", borderRadius: 8, background: theme.bg,
+                        border: `1px solid ${theme.border}`,
+                      }}>
+                        <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>{s.icon} {s.label}</div>
+                        <div style={{ fontSize: 13, fontWeight: 600 }}>{s.value}</div>
+                      </div>
+                    ))}
+                    <div style={{
+                      padding: "10px 12px", borderRadius: 8, background: theme.bg,
+                      border: `1px solid ${theme.border}`, display: "flex", flexDirection: "column", gap: 6,
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                        <span style={{ fontSize: 14 }}>🔐</span>
+                        <span style={{ color: theme.textDim }}>Session Saved</span>
+                        <span style={{ marginLeft: "auto", fontSize: 14 }}>
+                          {h.sync.session_file_exists
+                            ? <span style={{ color: "#22c55e" }}>✓</span>
+                            : <span style={{ color: "#ef4444" }}>✗</span>
+                          }
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                        <span style={{ fontSize: 14 }}>📡</span>
+                        <span style={{ color: theme.textDim }}>IMAP Connected</span>
+                        <span style={{
+                          marginLeft: "auto", width: 8, height: 8, borderRadius: "50%",
+                          background: h.sync.imap_connected ? "#22c55e" : "#6b7280",
+                          display: "inline-block",
+                        }} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div style={{
+                  padding: "16px 20px",
+                  display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between",
+                }}>
+                  <div style={{ display: "flex", gap: 12 }}>
+                    <button
+                      onClick={() => { setShowClearModal(true); setClearConfirmText(""); }}
+                      style={{
+                        padding: "8px 18px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        background: "transparent", border: `1px solid ${theme.danger}`,
+                        color: theme.danger, cursor: "pointer",
+                      }}
+                    >
+                      🔄 Clear All Data
+                    </button>
+                    <button
+                      onClick={async () => {
+                        try {
+                          const res = await fetch(`${API}/api/storage/backup`);
+                          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                          const blob = await res.blob();
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement("a");
+                          a.href = url;
+                          a.download = `mailscraper_backup_${new Date().toISOString().slice(0, 10)}.db`;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                          notify("Backup downloaded", "success");
+                        } catch (e) {
+                          notify("Failed to download backup", "error");
+                        }
+                      }}
+                      style={{
+                        padding: "8px 18px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        background: "transparent", border: `1px solid ${theme.border}`,
+                        color: theme.textMuted, cursor: "pointer",
+                      }}
+                    >
+                      📦 Export Backup
+                    </button>
+                  </div>
+                  {storageLastUpdated && (
+                    <div style={{ fontSize: 10, color: theme.textDim }}>
+                      Updated {timeAgo(storageLastUpdated.toISOString())}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+          );
+        })()}
+
+        {/* ─── Clear Data Confirmation Modal ─────────────────────────── */}
+        {showClearModal && (
+          <div
+            style={{
+              position: "fixed", inset: 0, zIndex: 3000,
+              background: "rgba(0,0,0,0.7)", display: "flex",
+              alignItems: "center", justifyContent: "center",
+            }}
+            onClick={() => setShowClearModal(false)}
+          >
+            <div
+              style={{
+                background: theme.surface, borderRadius: 12, padding: 24,
+                border: `1px solid ${theme.border}`, maxWidth: 440, width: "90%",
+                boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 8, color: theme.danger }}>
+                🔄 Clear All Data
+              </h3>
+              <p style={{ fontSize: 12, color: theme.textMuted, lineHeight: 1.6, marginBottom: 16 }}>
+                This will delete all candidates, emails, jobs, and match results from the local database.
+                Attachment files will <strong>NOT</strong> be deleted.
+              </p>
+              <p style={{ fontSize: 12, color: theme.textMuted, marginBottom: 12 }}>
+                Type <strong style={{ color: theme.danger }}>CONFIRM</strong> to proceed:
+              </p>
+              <input
+                type="text"
+                value={clearConfirmText}
+                onChange={(e) => setClearConfirmText(e.target.value)}
+                placeholder="Type CONFIRM"
+                style={{
+                  width: "100%", padding: "8px 12px", borderRadius: 6, fontSize: 13,
+                  background: theme.bg, border: `1px solid ${theme.border}`,
+                  color: theme.text, outline: "none", marginBottom: 16,
+                }}
+                autoFocus
+              />
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <button
+                  onClick={() => setShowClearModal(false)}
+                  style={{
+                    padding: "8px 18px", borderRadius: 8, fontSize: 12,
+                    background: "transparent", border: `1px solid ${theme.border}`,
+                    color: theme.textMuted, cursor: "pointer",
+                  }}
+                >Cancel</button>
+                <button
+                  disabled={clearConfirmText !== "CONFIRM"}
+                  onClick={async () => {
+                    try {
+                      const res = await fetch(`${API}/api/storage/clear-data`, {
+                        method: "DELETE",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ confirm: "CONFIRM" }),
+                      });
+                      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                      notify("All data cleared", "success");
+                      setShowClearModal(false);
+                      setCandidates([]);
+                      setJobs([]);
+                      setMatchResults([]);
+                      loadStorageHealth();
+                    } catch (e) {
+                      notify("Failed to clear data", "error");
+                    }
+                  }}
+                  style={{
+                    padding: "8px 18px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                    background: clearConfirmText === "CONFIRM" ? theme.danger : `${theme.danger}30`,
+                    border: "none", color: "#fff", cursor: clearConfirmText === "CONFIRM" ? "pointer" : "not-allowed",
+                    opacity: clearConfirmText === "CONFIRM" ? 1 : 0.5,
+                  }}
+                >Delete Everything</button>
+              </div>
             </div>
           </div>
         )}

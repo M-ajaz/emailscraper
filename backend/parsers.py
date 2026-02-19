@@ -4,6 +4,7 @@ Resume / document parsing utilities.
 - extract_text_from_pdf(filepath)  – via pdfplumber
 - extract_text_from_docx(filepath) – via python-docx
 - extract_entities(raw_text)       – regex + keyword matching (no external APIs)
+- extract_name_from_subject(subject) – parse candidate name from forwarded email subjects
 """
 
 import re
@@ -42,6 +43,7 @@ _SKILL_GROUPS = {
         "golang", "rust", "ruby", "php", "swift", "kotlin", "scala",
         "perl", "r", "matlab", "dart", "lua", "shell", "bash",
         "powershell", "sql", "html", "css", "sass", "less",
+        "embedded c", "vhdl", "verilog",
     ],
     "frontend": [
         "react", "reactjs", "react.js", "angular", "angularjs", "vue",
@@ -64,7 +66,7 @@ _SKILL_GROUPS = {
         "natural language processing", "computer vision",
         "data science", "data engineering", "data analysis",
         "power bi", "powerbi", "tableau", "looker", "dbt",
-        "etl", "data pipeline",
+        "etl", "data pipeline", "simulink", "signal processing",
     ],
     "cloud_devops": [
         "aws", "azure", "gcp", "google cloud", "heroku",
@@ -91,6 +93,10 @@ _SKILL_GROUPS = {
     "mobile": [
         "android", "ios", "react native", "flutter", "xamarin",
         "swiftui", "objective-c", "cordova", "ionic",
+    ],
+    "electrical_hardware": [
+        "autocad", "plc", "altium", "labview", "solidworks",
+        "fpga", "pcb", "rf", "power electronics",
     ],
 }
 
@@ -143,7 +149,22 @@ _TITLE_PATTERNS: list[re.Pattern] = [
             r'scrum master|'
             r'ux designer|ui designer|ux/ui designer|product designer|'
             r'business analyst|data architect|'
-            r'cto|cio|vp engineering|director of engineering'
+            r'cto|cio|vp engineering|director of engineering|'
+            r'electrical engineer(?:ing)?|'
+            r'mechanical engineer(?:ing)?|'
+            r'hardware engineer(?:ing)?|'
+            r'embedded (?:systems? )?engineer|'
+            r'firmware engineer|'
+            r'rf engineer|'
+            r'controls? engineer|'
+            r'power engineer|'
+            r'design engineer|'
+            r'manufacturing engineer|'
+            r'process engineer|'
+            r'validation engineer|'
+            r'test engineer|'
+            r'field (?:service )?engineer|'
+            r'applications? engineer'
         r')',
     ]
 ]
@@ -152,17 +173,28 @@ _TITLE_PATTERNS: list[re.Pattern] = [
 # ─── Years-of-experience patterns ───────────────────────────────────────────
 
 _YOE_PATTERNS = [
-    # "5+ years", "10 yrs", "3-5 years", "over 8 years"
+    # "5+ years of experience", "10 yrs", "3-5 years", "over 8 years",
+    # "more than 6 years", "15+ yrs of work"
     re.compile(
         r'(?:over\s+|more\s+than\s+)?'
         r'(\d{1,2})\s*[\-–to]*\s*\d{0,2}\s*\+?\s*'
         r'(?:years?|yrs?|yr)\b'
-        r'(?:\s+of\s+(?:experience|exp|work))?',
+        r'(?:\s+of\s+(?:experience|exp|work|professional))?',
         re.IGNORECASE,
     ),
     # "experience: 7 years"
     re.compile(
         r'experience\s*(?::|\s)\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)',
+        re.IGNORECASE,
+    ),
+    # "X-year career" / "X year career"
+    re.compile(
+        r'(\d{1,2})[\s-]*year\s+career',
+        re.IGNORECASE,
+    ),
+    # "X years experience" (without "of")
+    re.compile(
+        r'(\d{1,2})\s*\+?\s*(?:years?|yrs?)\s+experience',
         re.IGNORECASE,
     ),
 ]
@@ -214,12 +246,132 @@ for _loc in sorted(_LOCATIONS, key=len, reverse=True):
         _loc,
         re.compile(r'\b' + re.escape(_loc) + r'\b', re.IGNORECASE),
     ))
-# State codes: require ", XX" or "| XX" context and case-sensitive match
+# State codes: require ", XX" or "| XX" or " XX" after a city-like word context
+# and case-sensitive match
 for _st in _US_STATES:
     _LOCATION_PATTERNS.append((
         _st,
         re.compile(r'(?:,\s*|\|\s*)' + _st + r'\b'),
     ))
+
+# "City, ST" / "City ST" pattern — captures the full "City, ST" or "City ST" pair
+# for US locations not in the named list
+_CITY_STATE_RE = re.compile(
+    r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)'     # City (1-2 capitalized words)
+    r'[,\s]\s*'                                # comma or space separator
+    r'([A-Z]{2})\b'                            # 2-letter state code
+)
+
+
+# ─── Subject-line name extraction ────────────────────────────────────────────
+
+# Patterns for forwarded recruitment email subjects like:
+#   "Fw: Protingent Candidate - Dan T. Tran - Electrical Engineer - LYNK #28651"
+#   "Re: Candidate - Jane Smith - Software Engineer"
+#   "Fwd: ABC Corp Candidate - John Doe - Data Analyst - REQ #12345"
+
+_SUBJECT_NAME_PATTERNS = [
+    # "Candidate - FirstName [M.] LastName - Title"
+    re.compile(
+        r'[Cc]andidate\s*[-–—:]\s*'
+        r'([A-Z][a-zA-Z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)'
+        r'\s*[-–—]',
+    ),
+    # "Candidate: FirstName LastName -"
+    re.compile(
+        r'[Cc]andidate\s*:\s*'
+        r'([A-Z][a-zA-Z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)'
+        r'\s*[-–—]',
+    ),
+    # "Candidate - FirstName LastName" (at end of subject, no trailing dash)
+    re.compile(
+        r'[Cc]andidate\s*[-–—:]\s*'
+        r'([A-Z][a-zA-Z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)'
+        r'\s*$',
+    ),
+]
+
+# "- Title -" or "- Title - LYNK" pattern to extract job title from subject
+_SUBJECT_TITLE_PATTERNS = [
+    # After the name segment: "- Title - LYNK/REQ/#"
+    re.compile(
+        r'[-–—]\s*'
+        r'([A-Z][A-Za-z /&]+(?:Engineer|Developer|Analyst|Manager|Designer|Architect|Scientist|Lead|Director|Administrator|Specialist|Consultant|Coordinator|Technician|Intern)(?:\s+\w+)?)'
+        r'\s*(?:[-–—]|$)',
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_name_from_subject(subject: str) -> str | None:
+    """
+    Parse candidate name from forwarded recruitment email subjects.
+
+    Handles patterns like:
+      "Fw: Protingent Candidate - Dan T. Tran - Electrical Engineer - LYNK #28651"
+      "Re: Candidate - Jane Smith - Software Engineer"
+
+    Returns the candidate name string or None if no pattern matched.
+    """
+    if not subject:
+        return None
+
+    # Strip common Fw/Fwd/Re prefixes
+    cleaned = re.sub(r'^(?:(?:Fw|Fwd|Re)\s*:\s*)+', '', subject, flags=re.IGNORECASE).strip()
+
+    for pat in _SUBJECT_NAME_PATTERNS:
+        m = pat.search(cleaned)
+        if m:
+            name = m.group(1).strip()
+            # Reject if too many words (likely a sentence, not a name)
+            if 2 <= len(name.split()) <= 4:
+                return name
+
+    return None
+
+
+def extract_title_from_subject(subject: str) -> str | None:
+    """
+    Parse job title from forwarded recruitment email subjects.
+
+    Handles patterns like:
+      "Fw: Protingent Candidate - Dan T. Tran - Electrical Engineer - LYNK #28651"
+
+    Returns the title string or None.
+    """
+    if not subject:
+        return None
+
+    cleaned = re.sub(r'^(?:(?:Fw|Fwd|Re)\s*:\s*)+', '', subject, flags=re.IGNORECASE).strip()
+
+    for pat in _SUBJECT_TITLE_PATTERNS:
+        m = pat.search(cleaned)
+        if m:
+            title = m.group(1).strip()
+            if 2 <= len(title) <= 80:
+                return title
+
+    return None
+
+
+# ─── Phone patterns (for resume text) ───────────────────────────────────────
+
+_PHONE_PATTERNS = [
+    # +91-XXXXXXXXXX or +91 XXXXXXXXXX (Indian format)
+    re.compile(r'\+91[\s\-.]?\d{5}[\s\-.]?\d{5}\b'),
+    # +1 (555) 123-4567, (555) 123-4567, 555-123-4567 (US/Canada)
+    re.compile(
+        r'(?:\+1[\s\-.]?)?'
+        r'\(?\d{3}\)?[\s\-.]?'
+        r'\d{3}[\s\-.]?\d{4}\b'
+    ),
+    # +44 20 7946 0958 (UK / international)
+    re.compile(
+        r'\+\d{1,3}[\s\-.]?'
+        r'\d{2,4}[\s\-.]?'
+        r'\d{3,4}[\s\-.]?\d{3,4}\b'
+    ),
+]
 
 
 # ─── Entity extraction ──────────────────────────────────────────────────────
@@ -235,9 +387,11 @@ def extract_entities(raw_text: str) -> dict:
         years_exp  : int | None – parsed years of experience
         titles     : list[str]  – extracted job titles
         locations  : list[str]  – city / country / state matches
+        phone      : str | None – first phone number found
+        name       : str | None – always None (set by pipeline from subject/email)
     """
     if not raw_text:
-        return {"skills": [], "years_exp": None, "titles": [], "locations": []}
+        return {"skills": [], "years_exp": None, "titles": [], "locations": [], "phone": None, "name": None}
 
     # --- Skills ---
     found_skills: list[str] = []
@@ -282,9 +436,41 @@ def extract_entities(raw_text: str) -> dict:
                 seen_locations.add(key)
                 found_locations.append(canonical)
 
+    # Also try the generic "City, ST" / "City ST" pattern
+    for m in _CITY_STATE_RE.finditer(raw_text):
+        city = m.group(1)
+        state = m.group(2)
+        if state in _US_STATES:
+            loc_str = f"{city}, {state}"
+            key = loc_str.lower()
+            if key not in seen_locations:
+                seen_locations.add(key)
+                # Remove bare city or bare state if "City, ST" is more specific
+                city_key = city.lower()
+                state_key = state.lower()
+                for bare in (city_key, state_key):
+                    if bare in seen_locations:
+                        found_locations = [l for l in found_locations if l.lower() != bare]
+                        seen_locations.discard(bare)
+                seen_locations.add(key)
+                found_locations.append(loc_str)
+
+    # --- Phone ---
+    phone: str | None = None
+    for pat in _PHONE_PATTERNS:
+        m = pat.search(raw_text)
+        if m:
+            raw = m.group(0).strip()
+            digits = re.sub(r'\D', '', raw)
+            if len(digits) >= 7:
+                phone = raw
+                break
+
     return {
         "skills": found_skills,
         "years_exp": years_exp,
         "titles": found_titles,
         "locations": found_locations,
+        "phone": phone,
+        "name": None,
     }

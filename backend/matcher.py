@@ -126,6 +126,8 @@ def _candidate_to_dict(c: Candidate) -> dict:
         "years_exp": c.years_exp,
         "raw_resume_path": c.raw_resume_path,
         "source_email_uid": c.source_email_uid,
+        "notes": c.notes or "",
+        "tags": json.loads(c.tags) if c.tags else [],
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
