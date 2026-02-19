@@ -204,7 +204,7 @@ export default function OutlookScraper() {
   const [auth, setAuth] = useState({ loading: true, authenticated: false, user: null });
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [loginLoading, setLoginLoading] = useState(false);
-  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments
+  const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments | candidates | jobs | recruit-export
   const [folders, setFolders] = useState([]);
   const [emails, setEmails] = useState([]);
   const [selectedEmail, setSelectedEmail] = useState(null);
@@ -230,6 +230,20 @@ export default function OutlookScraper() {
   const [expandedScrapeCards, setExpandedScrapeCards] = useState(new Set());
   const [notification, setNotification] = useState(null);
 
+  // ─── Recruitment State ──────────────────────────────────────────────────
+  const [candidates, setCandidates] = useState([]);
+  const [candidateSearch, setCandidateSearch] = useState("");
+  const debouncedCandSearch = useDebounce(candidateSearch, 300);
+  const [jobs, setJobs] = useState([]);
+  const [selectedJobId, setSelectedJobId] = useState(null);
+  const [matchResults, setMatchResults] = useState([]);
+  const [matchLoading, setMatchLoading] = useState(false);
+  const [jobForm, setJobForm] = useState({
+    title: "", jd_raw: "", required_skills: "",
+    min_exp: 0, location: "", remote_ok: false,
+  });
+  const [exportJobId, setExportJobId] = useState("");
+
   const notify = (msg, type = "info") => {
     setNotification({ msg, type });
     setTimeout(() => setNotification(null), 4000);
@@ -246,6 +260,13 @@ export default function OutlookScraper() {
       loadEmails(activeFolder, 0, debouncedSearch, inboxFilters);
     }
   }, [debouncedSearch]);
+
+  // ─── Auto-search candidates on debounced input ───────────────────────
+  useEffect(() => {
+    if (auth.authenticated && view === "candidates") {
+      loadCandidates(debouncedCandSearch);
+    }
+  }, [debouncedCandSearch]);
 
   const checkAuth = async () => {
     try {
@@ -457,6 +478,95 @@ export default function OutlookScraper() {
   const handleSearch = (e) => {
     e.preventDefault();
     loadEmails(activeFolder, 0, searchQuery, inboxFilters);
+  };
+
+  // ─── Recruitment Data Loading ─────────────────────────────────────────
+  const loadCandidates = async (search = "") => {
+    try {
+      const params = new URLSearchParams();
+      if (search) params.set("name", search);
+      const res = await fetch(`${API}/api/candidates?${params}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setCandidates(await res.json());
+    } catch (e) {
+      notify("Failed to load candidates", "error");
+    }
+  };
+
+  const loadJobs = async () => {
+    try {
+      const res = await fetch(`${API}/api/jobs`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setJobs(await res.json());
+    } catch (e) {
+      notify("Failed to load jobs", "error");
+    }
+  };
+
+  const createJob = async () => {
+    try {
+      const skills = jobForm.required_skills
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const res = await fetch(`${API}/api/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...jobForm,
+          required_skills: skills,
+          min_exp: parseFloat(jobForm.min_exp) || 0,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      notify("Job created", "success");
+      setJobForm({ title: "", jd_raw: "", required_skills: "", min_exp: 0, location: "", remote_ok: false });
+      loadJobs();
+    } catch (e) {
+      notify("Failed to create job", "error");
+    }
+  };
+
+  const runJobMatch = async (jobId) => {
+    setMatchLoading(true);
+    try {
+      const res = await fetch(`${API}/api/jobs/${jobId}/match`, { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setMatchResults(data.results || []);
+      notify(`Matched ${data.total_candidates} candidates`, "success");
+    } catch (e) {
+      notify("Matching failed", "error");
+    }
+    setMatchLoading(false);
+  };
+
+  const loadMatchResults = async (jobId) => {
+    try {
+      const res = await fetch(`${API}/api/jobs/${jobId}/results`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setMatchResults(data.results || []);
+    } catch (e) {
+      setMatchResults([]);
+    }
+  };
+
+  const exportRecruitCSV = async (jobId) => {
+    try {
+      const res = await fetch(`${API}/api/export/candidates-csv?job_id=${jobId}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `match_results_job_${jobId}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      notify("CSV downloaded", "success");
+    } catch (e) {
+      notify("CSV export failed", "error");
+    }
   };
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -687,6 +797,9 @@ export default function OutlookScraper() {
             { id: "scrape", icon: "🔍", label: "Scrape & Export", action: () => { setView("scrape"); setSelectedEmail(null); } },
             { id: "attachments", icon: "📎", label: "Attachments", badge: storedAttachments.length || null, action: () => { setView("attachments"); setSelectedEmail(null); loadAttachments(attachmentFilter); } },
             { id: "stats", icon: "📊", label: "Statistics", action: () => { setView("stats"); setSelectedEmail(null); loadStats(); } },
+            { id: "candidates", icon: "👤", label: "Candidates", action: () => { setView("candidates"); setSelectedEmail(null); loadCandidates(candidateSearch); } },
+            { id: "jobs", icon: "💼", label: "Jobs & Match", action: () => { setView("jobs"); setSelectedEmail(null); loadJobs(); } },
+            { id: "recruit-export", icon: "📤", label: "Recruit Export", action: () => { setView("recruit-export"); setSelectedEmail(null); loadJobs(); } },
           ].map((item) => (
             <button
               key={item.id}
@@ -1770,6 +1883,398 @@ export default function OutlookScraper() {
                 ))}
               </div>
             )}
+          </div>
+        )}
+        {/* ─── Candidates View ─────────────────────────────────────── */}
+        {view === "candidates" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
+              Candidates
+            </h2>
+            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 20 }}>
+              Browse all extracted candidates from scraped email attachments.
+            </p>
+
+            {/* Search Bar */}
+            <div style={{ marginBottom: 20, maxWidth: 400 }}>
+              <input
+                type="text"
+                placeholder="Search by name or skill..."
+                value={candidateSearch}
+                onChange={(e) => setCandidateSearch(e.target.value)}
+                style={{
+                  width: "100%", padding: "8px 14px", borderRadius: 6,
+                  background: theme.surface, border: `1px solid ${theme.border}`,
+                  color: theme.text, fontSize: 12, outline: "none",
+                }}
+                onFocus={(e) => e.target.style.borderColor = theme.accent}
+                onBlur={(e) => e.target.style.borderColor = theme.border}
+              />
+            </div>
+
+            <span style={{ fontSize: 11, color: theme.textDim, marginBottom: 12, display: "block" }}>
+              {candidates.length} candidate{candidates.length !== 1 ? "s" : ""}
+            </span>
+
+            {/* Table */}
+            {candidates.length === 0 ? (
+              <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                No candidates found. Scrape emails with resume attachments to populate.
+              </div>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
+                      {["Name", "Email", "Phone", "Skills", "Experience", "Location", "Source UID"].map((h) => (
+                        <th key={h} style={{
+                          padding: "8px 12px", textAlign: "left", fontSize: 10,
+                          color: theme.textDim, fontWeight: 600, textTransform: "uppercase",
+                          letterSpacing: 0.5, whiteSpace: "nowrap",
+                        }}>
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {candidates.map((c) => (
+                      <tr key={c.id} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                        <td style={{ padding: "10px 12px", fontWeight: 500 }}>{c.name}</td>
+                        <td style={{ padding: "10px 12px", color: theme.accent }}>{c.email || "\u2014"}</td>
+                        <td style={{ padding: "10px 12px", color: theme.textMuted }}>{c.phone || "\u2014"}</td>
+                        <td style={{ padding: "10px 12px", maxWidth: 200 }}>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                            {(c.skills || []).slice(0, 5).map((s, i) => (
+                              <Badge key={i} color={theme.accent}>{s}</Badge>
+                            ))}
+                            {(c.skills || []).length > 5 && (
+                              <Badge color={theme.textDim}>+{c.skills.length - 5}</Badge>
+                            )}
+                          </div>
+                        </td>
+                        <td style={{ padding: "10px 12px", color: theme.textMuted }}>
+                          {c.years_exp != null ? `${c.years_exp}y` : "\u2014"}
+                        </td>
+                        <td style={{ padding: "10px 12px", color: theme.textMuted }}>{c.location || "\u2014"}</td>
+                        <td style={{
+                          padding: "10px 12px", fontSize: 10, color: theme.textDim,
+                          maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }}>
+                          {c.source_email_uid || "\u2014"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ─── Jobs & Match View ───────────────────────────────────── */}
+        {view === "jobs" && (
+          <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+            {/* Left Panel: Create Job + Job List */}
+            <div style={{
+              width: 380, flexShrink: 0, borderRight: `1px solid ${theme.border}`,
+              overflowY: "auto", padding: 20,
+            }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, letterSpacing: -0.3 }}>
+                Create Job Requisition
+              </h3>
+              <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 24 }}>
+                <div>
+                  <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                    Job Title
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Senior Software Engineer"
+                    value={jobForm.title}
+                    onChange={(e) => setJobForm({ ...jobForm, title: e.target.value })}
+                    style={{
+                      width: "100%", padding: "8px 12px", borderRadius: 6,
+                      background: theme.bg, border: `1px solid ${theme.border}`,
+                      color: theme.text, fontSize: 12, outline: "none",
+                    }}
+                  />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                    Job Description
+                  </label>
+                  <textarea
+                    placeholder="Paste the full JD text here..."
+                    value={jobForm.jd_raw}
+                    onChange={(e) => setJobForm({ ...jobForm, jd_raw: e.target.value })}
+                    rows={4}
+                    style={{
+                      width: "100%", padding: "8px 12px", borderRadius: 6,
+                      background: theme.bg, border: `1px solid ${theme.border}`,
+                      color: theme.text, fontSize: 12, outline: "none", resize: "vertical",
+                      fontFamily: "inherit",
+                    }}
+                  />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                    Required Skills (comma-separated)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="python, react, sql, docker"
+                    value={jobForm.required_skills}
+                    onChange={(e) => setJobForm({ ...jobForm, required_skills: e.target.value })}
+                    style={{
+                      width: "100%", padding: "8px 12px", borderRadius: 6,
+                      background: theme.bg, border: `1px solid ${theme.border}`,
+                      color: theme.text, fontSize: 12, outline: "none",
+                    }}
+                  />
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <div>
+                    <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      Min Experience (yrs)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={jobForm.min_exp}
+                      onChange={(e) => setJobForm({ ...jobForm, min_exp: e.target.value })}
+                      style={{
+                        width: "100%", padding: "8px 12px", borderRadius: 6,
+                        background: theme.bg, border: `1px solid ${theme.border}`,
+                        color: theme.text, fontSize: 12, outline: "none",
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                      Location
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. New York, NY"
+                      value={jobForm.location}
+                      onChange={(e) => setJobForm({ ...jobForm, location: e.target.value })}
+                      style={{
+                        width: "100%", padding: "8px 12px", borderRadius: 6,
+                        background: theme.bg, border: `1px solid ${theme.border}`,
+                        color: theme.text, fontSize: 12, outline: "none",
+                      }}
+                    />
+                  </div>
+                </div>
+                <label style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  fontSize: 12, color: theme.textMuted, cursor: "pointer",
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={jobForm.remote_ok}
+                    onChange={(e) => setJobForm({ ...jobForm, remote_ok: e.target.checked })}
+                    style={{ accentColor: theme.accent }}
+                  />
+                  Remote OK
+                </label>
+                <button
+                  onClick={createJob}
+                  disabled={!jobForm.title.trim()}
+                  style={{
+                    padding: "10px 20px", borderRadius: 8, border: "none",
+                    background: theme.accent, color: "#fff", fontSize: 12,
+                    fontWeight: 600, cursor: !jobForm.title.trim() ? "not-allowed" : "pointer",
+                    opacity: !jobForm.title.trim() ? 0.5 : 1,
+                  }}
+                >
+                  Save Job
+                </button>
+              </div>
+
+              {/* Job List */}
+              <div style={{
+                fontSize: 10, fontWeight: 600, color: theme.textDim, marginBottom: 10,
+                textTransform: "uppercase", letterSpacing: 1,
+              }}>
+                Saved Jobs ({jobs.length})
+              </div>
+              {jobs.length === 0 ? (
+                <div style={{ padding: 20, textAlign: "center", color: theme.textDim, fontSize: 11 }}>
+                  No jobs yet. Create one above.
+                </div>
+              ) : jobs.map((j) => (
+                <div
+                  key={j.id}
+                  onClick={() => { setSelectedJobId(j.id); loadMatchResults(j.id); }}
+                  style={{
+                    padding: "10px 12px", borderRadius: 6, marginBottom: 6,
+                    background: selectedJobId === j.id ? theme.accentGlow : theme.bg,
+                    border: `1px solid ${selectedJobId === j.id ? theme.accent : theme.border}`,
+                    cursor: "pointer", transition: "all 0.15s",
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{j.title}</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {(j.required_skills || []).slice(0, 4).map((s, i) => (
+                      <Badge key={i} color={theme.purple}>{s}</Badge>
+                    ))}
+                    {(j.required_skills || []).length > 4 && (
+                      <Badge color={theme.textDim}>+{j.required_skills.length - 4}</Badge>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 10, color: theme.textDim, marginTop: 6 }}>
+                    {j.min_exp ? `${j.min_exp}+ yrs` : "Any exp"} · {j.location || "Any location"}
+                    {j.remote_ok && " · Remote"}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Right Panel: Match Results */}
+            <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+              {selectedJobId ? (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+                    <h3 style={{ fontSize: 14, fontWeight: 700, flex: 1, letterSpacing: -0.3 }}>
+                      Match Results
+                    </h3>
+                    <button
+                      onClick={() => runJobMatch(selectedJobId)}
+                      disabled={matchLoading}
+                      style={{
+                        padding: "8px 20px", borderRadius: 6, border: "none",
+                        background: theme.success, color: "#fff", fontSize: 12,
+                        fontWeight: 600, cursor: matchLoading ? "not-allowed" : "pointer",
+                        opacity: matchLoading ? 0.6 : 1,
+                      }}
+                    >
+                      {matchLoading ? "Matching..." : "Run Match"}
+                    </button>
+                  </div>
+
+                  {matchLoading ? <Spinner /> : matchResults.length === 0 ? (
+                    <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                      No results yet. Click "Run Match" to score all candidates against this job.
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {matchResults.map((r, i) => {
+                        const fitColor = r.fit_level === "high" ? theme.success
+                          : r.fit_level === "medium" ? theme.warning : theme.danger;
+                        const c = r.candidate;
+                        const matchedSkills = new Set();
+                        (r.match_reasons || []).forEach((reason) => {
+                          const m = reason.match(/Skills matched.*?:\s*(.+)/i);
+                          if (m) m[1].split(",").forEach((s) => matchedSkills.add(s.trim().toLowerCase()));
+                        });
+                        return (
+                          <div key={i} style={{
+                            background: theme.surface, borderRadius: 8, padding: 16,
+                            border: `1px solid ${theme.border}`,
+                          }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                              {/* Score Badge */}
+                              <div style={{
+                                width: 48, height: 48, borderRadius: "50%",
+                                background: `${fitColor}20`, border: `2px solid ${fitColor}`,
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                flexShrink: 0,
+                              }}>
+                                <span style={{ fontSize: 14, fontWeight: 700, color: fitColor }}>
+                                  {r.score}
+                                </span>
+                              </div>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>
+                                  {c.name}
+                                </div>
+                                <div style={{ fontSize: 11, color: theme.textMuted }}>
+                                  {c.email || ""}{c.phone ? ` · ${c.phone}` : ""}
+                                  {c.location ? ` · ${c.location}` : ""}
+                                </div>
+                              </div>
+                              <Badge color={fitColor}>{r.fit_level}</Badge>
+                            </div>
+
+                            {/* Skills with match highlighting */}
+                            {c.skills && c.skills.length > 0 && (
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+                                {c.skills.map((s, si) => (
+                                  <Badge
+                                    key={si}
+                                    color={matchedSkills.has(s.toLowerCase()) ? theme.success : theme.textDim}
+                                  >
+                                    {s}
+                                  </Badge>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Match Reasons */}
+                            <div style={{ fontSize: 11, color: theme.textMuted, lineHeight: 1.6 }}>
+                              {(r.match_reasons || []).map((reason, ri) => (
+                                <div key={ri} style={{ paddingLeft: 8 }}>· {reason}</div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
+                  Select a job from the left panel to view or run matches.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ─── Recruit Export View ─────────────────────────────────── */}
+        {view === "recruit-export" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
+              Recruit Export
+            </h2>
+            <p style={{ color: theme.textMuted, fontSize: 12, marginBottom: 24 }}>
+              Download match results as CSV for a specific job requisition.
+            </p>
+
+            <div style={{ maxWidth: 400 }}>
+              <label style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, display: "block", marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                Select Job
+              </label>
+              <select
+                value={exportJobId}
+                onChange={(e) => setExportJobId(e.target.value)}
+                style={{
+                  width: "100%", padding: "8px 12px", borderRadius: 6, marginBottom: 16,
+                  background: theme.surface, border: `1px solid ${theme.border}`,
+                  color: theme.text, fontSize: 12,
+                }}
+              >
+                <option value="">— Select a job —</option>
+                {jobs.map((j) => (
+                  <option key={j.id} value={j.id}>{j.title}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => exportRecruitCSV(exportJobId)}
+                disabled={!exportJobId}
+                style={{
+                  padding: "10px 24px", borderRadius: 8, border: "none",
+                  background: theme.accent, color: "#fff", fontSize: 13,
+                  fontWeight: 600, cursor: !exportJobId ? "not-allowed" : "pointer",
+                  opacity: !exportJobId ? 0.5 : 1,
+                  boxShadow: `0 4px 16px ${theme.accentGlow}`,
+                }}
+              >
+                Download CSV
+              </button>
+            </div>
           </div>
         )}
       </main>

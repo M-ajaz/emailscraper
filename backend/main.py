@@ -32,6 +32,13 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
+from database import (
+    create_tables as _create_db_tables,
+    SessionLocal, Candidate, JobRequisition, MatchResult,
+)
+from pipeline import process_attachment_into_candidate
+from matcher import run_match, _candidate_to_dict, _job_to_dict
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
@@ -444,6 +451,10 @@ async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
     return await call_next(request)
+
+
+# ─── Database init (idempotent) ──────────────────────────────────────────────
+_create_db_tables()
 
 
 # ─── Pydantic Models ────────────────────────────────────────────────────────
@@ -1137,6 +1148,22 @@ def _scrape_impl(
                         att_info.filename = saved_filename
                         att_info.download_url = f"/api/attachments/{saved_filename}"
                         att_info.preview_url = f"/api/attachments/{saved_filename}/preview"
+
+                        # ── Candidate pipeline: process resumes/CVs ──
+                        file_type = _classify_file_type(a["content_type"])
+                        if file_type in ("document", "pdf"):
+                            try:
+                                process_attachment_into_candidate(
+                                    attachment_filepath=str(ATTACHMENTS_DIR / saved_filename),
+                                    email_uid=str(parsed_uid),
+                                    email_body=text_body or "",
+                                    email_sender=from_addr,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Candidate pipeline failed for %s", saved_filename
+                                )
+
                     scraped_atts.append(att_info)
             else:
                 scraped_atts = [
@@ -1278,6 +1305,228 @@ def _get_stats_impl(conn: imaplib.IMAP4_SSL) -> MailboxStats:
 @app.get("/api/stats", response_model=MailboxStats)
 async def get_stats():
     return await _imap_op(_get_stats_impl)
+
+
+# ─── Recruitment: Pydantic models ────────────────────────────────────────────
+
+class JobCreateRequest(BaseModel):
+    title: str
+    jd_raw: Optional[str] = None
+    required_skills: Optional[List[str]] = None
+    min_exp: Optional[float] = None
+    location: Optional[str] = None
+    remote_ok: bool = False
+
+
+# ─── Recruitment: Candidate endpoints ───────────────────────────────────────
+
+@app.get("/api/candidates")
+async def list_candidates(
+    skill: Optional[str] = None,
+    location: Optional[str] = None,
+    name: Optional[str] = None,
+):
+    """List all candidates with optional filters."""
+    db = SessionLocal()
+    try:
+        q = db.query(Candidate)
+        if name:
+            q = q.filter(Candidate.name.ilike(f"%{name}%"))
+        if location:
+            q = q.filter(Candidate.location.ilike(f"%{location}%"))
+        if skill:
+            # JSON array stored as text — use LIKE for contains
+            q = q.filter(Candidate.skills.ilike(f"%{skill}%"))
+        candidates = q.order_by(Candidate.created_at.desc()).all()
+        return [_candidate_to_dict(c) for c in candidates]
+    finally:
+        db.close()
+
+
+@app.get("/api/candidates/{candidate_id}")
+async def get_candidate(candidate_id: int):
+    """Get a single candidate by ID."""
+    db = SessionLocal()
+    try:
+        c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+        if not c:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        return _candidate_to_dict(c)
+    finally:
+        db.close()
+
+
+# ─── Recruitment: Job endpoints ─────────────────────────────────────────────
+
+@app.post("/api/jobs")
+async def create_job(request: JobCreateRequest):
+    """Create a new job requisition."""
+    db = SessionLocal()
+    try:
+        job = JobRequisition(
+            title=request.title,
+            jd_raw=request.jd_raw,
+            required_skills=json.dumps(request.required_skills or []),
+            min_exp=request.min_exp,
+            location=request.location,
+            remote_ok=request.remote_ok,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return _job_to_dict(job)
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs")
+async def list_jobs():
+    """List all job requisitions."""
+    db = SessionLocal()
+    try:
+        jobs = db.query(JobRequisition).order_by(JobRequisition.created_at.desc()).all()
+        return [_job_to_dict(j) for j in jobs]
+    finally:
+        db.close()
+
+
+# ─── Recruitment: Matching endpoints ────────────────────────────────────────
+
+@app.post("/api/jobs/{job_id}/match")
+async def run_matching(job_id: int):
+    """Run the matching engine for a job against all candidates. Saves results."""
+    try:
+        results = run_match(job_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    db = SessionLocal()
+    try:
+        job = db.query(JobRequisition).filter(JobRequisition.id == job_id).first()
+        return {
+            "job": _job_to_dict(job),
+            "total_candidates": len(results),
+            "results": results,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs/{job_id}/results")
+async def get_match_results(job_id: int):
+    """Fetch saved match results for a job, ranked by score."""
+    db = SessionLocal()
+    try:
+        job = db.query(JobRequisition).filter(JobRequisition.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        matches = (
+            db.query(MatchResult)
+            .filter(MatchResult.job_id == job_id)
+            .order_by(MatchResult.score.desc())
+            .all()
+        )
+
+        results = []
+        for mr in matches:
+            c = db.query(Candidate).filter(Candidate.id == mr.candidate_id).first()
+            results.append({
+                "match_id": mr.id,
+                "candidate": _candidate_to_dict(c) if c else None,
+                "score": mr.score,
+                "match_reasons": json.loads(mr.match_reasons) if mr.match_reasons else [],
+                "fit_level": mr.fit_level,
+            })
+
+        return {
+            "job": _job_to_dict(job),
+            "total_candidates": len(results),
+            "results": results,
+        }
+    finally:
+        db.close()
+
+
+# ─── Recruitment: CSV export ────────────────────────────────────────────────
+
+@app.get("/api/export/candidates-csv")
+async def export_candidates_csv(job_id: Optional[int] = None):
+    """Export match results (or all candidates) as CSV via pandas."""
+    import pandas as pd
+
+    db = SessionLocal()
+    try:
+        if job_id:
+            job = db.query(JobRequisition).filter(JobRequisition.id == job_id).first()
+            if not job:
+                raise HTTPException(status_code=404, detail="Job not found")
+
+            matches = (
+                db.query(MatchResult)
+                .filter(MatchResult.job_id == job_id)
+                .order_by(MatchResult.score.desc())
+                .all()
+            )
+            if not matches:
+                raise HTTPException(status_code=404, detail="No match results found. Run matching first.")
+
+            rows = []
+            for mr in matches:
+                c = db.query(Candidate).filter(Candidate.id == mr.candidate_id).first()
+                if not c:
+                    continue
+                rows.append({
+                    "Rank": None,
+                    "Name": c.name,
+                    "Email": c.email or "",
+                    "Phone": c.phone or "",
+                    "Location": c.location or "",
+                    "Titles": "; ".join(json.loads(c.titles) if c.titles else []),
+                    "Skills": "; ".join(json.loads(c.skills) if c.skills else []),
+                    "Years Experience": c.years_exp or "",
+                    "Match Score": mr.score,
+                    "Fit Level": mr.fit_level or "",
+                    "Match Reasons": "; ".join(json.loads(mr.match_reasons) if mr.match_reasons else []),
+                    "Job Title": job.title,
+                })
+            # Fill rank after sorting (already sorted by score desc)
+            for i, row in enumerate(rows, 1):
+                row["Rank"] = i
+
+            filename = f"match_results_job{job_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+        else:
+            candidates = db.query(Candidate).order_by(Candidate.created_at.desc()).all()
+            if not candidates:
+                raise HTTPException(status_code=404, detail="No candidates in database")
+
+            rows = []
+            for c in candidates:
+                rows.append({
+                    "Name": c.name,
+                    "Email": c.email or "",
+                    "Phone": c.phone or "",
+                    "Location": c.location or "",
+                    "Titles": "; ".join(json.loads(c.titles) if c.titles else []),
+                    "Skills": "; ".join(json.loads(c.skills) if c.skills else []),
+                    "Years Experience": c.years_exp or "",
+                    "Source Email UID": c.source_email_uid or "",
+                    "Created At": c.created_at.isoformat() if c.created_at else "",
+                })
+
+            filename = f"candidates_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+
+        df = pd.DataFrame(rows)
+        output = io.StringIO()
+        df.to_csv(output, index=False)
+
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    finally:
+        db.close()
 
 
 # ─── Health Check ───────────────────────────────────────────────────────────
