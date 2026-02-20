@@ -296,7 +296,7 @@ def _decode_email_id(email_id: str) -> tuple[str, str]:
 
 # ─── Email parsing helpers ───────────────────────────────────────────────────
 
-def _decode_header_value(raw) -> str:
+def decode_mime_header(raw) -> str:
     if raw is None:
         return ""
     parts = email.header.decode_header(raw)
@@ -312,7 +312,7 @@ def _decode_header_value(raw) -> str:
 def _parse_address(addr_str: str) -> tuple[str, str]:
     if not addr_str:
         return ("Unknown", "")
-    decoded = _decode_header_value(addr_str)
+    decoded = decode_mime_header(addr_str)
     name, address = email.utils.parseaddr(decoded)
     return (name or address.split("@")[0] if address else "Unknown", address)
 
@@ -320,7 +320,7 @@ def _parse_address(addr_str: str) -> tuple[str, str]:
 def _parse_address_list(header_value: str) -> list[tuple[str, str]]:
     if not header_value:
         return []
-    decoded = _decode_header_value(header_value)
+    decoded = decode_mime_header(header_value)
     addresses = email.utils.getaddresses([decoded])
     return [(name or addr.split("@")[0], addr) for name, addr in addresses if addr]
 
@@ -366,7 +366,7 @@ def _get_attachments(msg: email.message.Message) -> list[dict]:
         disp = str(part.get("Content-Disposition", ""))
         filename = part.get_filename()
         if filename:
-            filename = _decode_header_value(filename)
+            filename = decode_mime_header(filename)
 
         is_attachment = "attachment" in disp or (
             filename and part.get_content_maintype() not in ("multipart",)
@@ -393,7 +393,7 @@ def _get_attachment_by_index(msg: email.message.Message, target_idx: int):
         disp = str(part.get("Content-Disposition", ""))
         filename = part.get_filename()
         if filename:
-            filename = _decode_header_value(filename)
+            filename = decode_mime_header(filename)
         is_attachment = "attachment" in disp or (
             filename and part.get_content_maintype() not in ("multipart",)
         )
@@ -435,7 +435,7 @@ def _parse_importance(msg: email.message.Message) -> str:
 
 
 def _parse_date(msg: email.message.Message) -> str:
-    raw = msg.get("Date", "")
+    raw = decode_mime_header(msg.get("Date", ""))
     try:
         dt = email.utils.parsedate_to_datetime(raw)
         return dt.isoformat()
@@ -1129,7 +1129,7 @@ def _list_emails_impl(
         return [], total
 
     uid_str = b",".join(page_uids)
-    status, fetch_data = conn.uid("FETCH", uid_str, "(UID FLAGS BODY.PEEK[]<0.32768>)")
+    status, fetch_data = conn.uid("FETCH", uid_str, "(UID FLAGS BODY.PEEK[]<0.65536>)")
 
     emails = []
     for uid_int, flags, raw_bytes in _parse_fetch_response(fetch_data):
@@ -1138,7 +1138,7 @@ def _list_emails_impl(
 
         try:
             msg = email.message_from_bytes(raw_bytes)
-            subject = _decode_header_value(msg.get("Subject", ""))
+            subject = decode_mime_header(msg.get("Subject", ""))
             from_name, from_email_addr = _parse_address(msg.get("From", ""))
             date_str = _parse_date(msg)
             imp = _parse_importance(msg)
@@ -1182,7 +1182,7 @@ def _get_email_impl(conn: imaplib.IMAP4_SSL, folder: str, uid: str) -> EmailDeta
     uid_int, flags, raw_bytes = parsed[0]
     msg = email.message_from_bytes(raw_bytes)
 
-    subject = _decode_header_value(msg.get("Subject", ""))
+    subject = decode_mime_header(msg.get("Subject", ""))
     from_name, from_addr = _parse_address(msg.get("From", ""))
     to_list = _parse_address_list(msg.get("To", ""))
     cc_list = _parse_address_list(msg.get("Cc", ""))
@@ -1194,7 +1194,7 @@ def _get_email_impl(conn: imaplib.IMAP4_SSL, folder: str, uid: str) -> EmailDeta
     is_seen = "\\Seen" in flags
     is_flagged = "\\Flagged" in flags
 
-    headers = [HeaderInfo(name=k, value=_decode_header_value(v)) for k, v in msg.items()]
+    headers = [HeaderInfo(name=k, value=decode_mime_header(v)) for k, v in msg.items()]
 
     eid = _encode_email_id(folder, str(uid_int))
     att_infos = [
@@ -1556,7 +1556,7 @@ def _scrape_impl(
 
         for parsed_uid, flags, raw_bytes in _parse_fetch_response(fetch_data):
             msg = email.message_from_bytes(raw_bytes)
-            subject = _decode_header_value(msg.get("Subject", ""))
+            subject = decode_mime_header(msg.get("Subject", ""))
             from_name, from_addr = _parse_address(msg.get("From", ""))
             to_list = _parse_address_list(msg.get("To", ""))
             cc_list = _parse_address_list(msg.get("Cc", ""))
@@ -1613,8 +1613,8 @@ def _scrape_impl(
 
             eid = _encode_email_id(folder, str(parsed_uid))
             all_emails.append(ScrapedEmailData(
-                id=eid, subject=subject, sender_name=from_name,
-                sender_email=from_addr,
+                id=eid, subject=subject or "(No Subject)", sender_name=from_name or "Unknown",
+                sender_email=from_addr or "",
                 to=[RecipientInfo(name=n, email=e) for n, e in to_list],
                 cc=[RecipientInfo(name=n, email=e) for n, e in cc_list],
                 received=date_str, sent=date_str,

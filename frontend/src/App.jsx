@@ -78,6 +78,9 @@ const IconBtn = ({ children, onClick, active, title, style: s }) => (
   </button>
 );
 
+// ─── HTML detection helper ──────────────────────────────────────────────────
+const isHtmlContent = (s) => !!s && /<[a-z/!][^>]*>/i.test(s);
+
 // ─── Safe HTML Email Renderer (sandboxed iframe) ────────────────────────────
 const SafeEmailBody = ({ html, text }) => {
   const iframeRef = useRef(null);
@@ -101,7 +104,8 @@ const SafeEmailBody = ({ html, text }) => {
     return () => clearInterval(timer);
   }, [html, text]);
 
-  if (html) {
+  const htmlContent = html || (text && isHtmlContent(text) ? text : null);
+  if (htmlContent) {
     const wrappedHtml = `
       <!DOCTYPE html>
       <html><head>
@@ -113,7 +117,7 @@ const SafeEmailBody = ({ html, text }) => {
           a { color: #3b82f6; }
           table { max-width: 100%; }
         </style>
-      </head><body>${html}</body></html>`;
+      </head><body>${htmlContent}</body></html>`;
 
     return (
       <iframe
@@ -247,6 +251,8 @@ export default function OutlookScraper() {
   });
   const [exportJobId, setExportJobId] = useState("");
   const [jdUploading, setJdUploading] = useState(false);
+  const [candidatesLoading, setCandidatesLoading] = useState(false);
+  const [jobsLoading, setJobsLoading] = useState(false);
   const [tagFilter, setTagFilter] = useState("");
   const [selectedCandidate, setSelectedCandidate] = useState(null);
   const [selectedCandidateId, setSelectedCandidateId] = useState(null);
@@ -254,6 +260,8 @@ export default function OutlookScraper() {
   const [profileActiveTab, setProfileActiveTab] = useState("resume");
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileNotesSaved, setProfileNotesSaved] = useState(false);
+  const profileNotesOriginalRef = useRef("");
+  const [copiedField, setCopiedField] = useState(null);
   const [expandedCandidateId, setExpandedCandidateId] = useState(null);
   const [expandedMatchIdx, setExpandedMatchIdx] = useState(null);
   const [candidateNotesDraft, setCandidateNotesDraft] = useState({});
@@ -373,6 +381,8 @@ export default function OutlookScraper() {
     return `${Math.floor(days / 7)}w ago`;
   };
 
+  const fmtNum = (n) => (n || 0).toLocaleString();
+
   // ─── Pre-load cached data from SQLite on mount ─────────────────────────
   useEffect(() => {
     (async () => {
@@ -397,6 +407,28 @@ export default function OutlookScraper() {
         }
       } catch (_) { /* silent pre-load */ }
     })();
+  }, []);
+
+  // ─── Refresh DB stats every 30s ───────────────────────────────────────
+  useEffect(() => {
+    const refreshDbStats = async () => {
+      try {
+        const [candRes, emailRes] = await Promise.all([
+          fetch(`${API}/api/candidates`).catch(() => null),
+          fetch(`${API}/api/emails?source=cache&top=1`).catch(() => null),
+        ]);
+        if (candRes && candRes.ok) {
+          const data = await candRes.json();
+          setDbStats((prev) => ({ ...prev, candidates: data.length }));
+        }
+        if (emailRes && emailRes.ok) {
+          const data = await emailRes.json();
+          setDbStats((prev) => ({ ...prev, emails: data.total || 0 }));
+        }
+      } catch (_) {}
+    };
+    const interval = setInterval(refreshDbStats, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   // ─── Auth ───────────────────────────────────────────────────────────────
@@ -738,6 +770,7 @@ export default function OutlookScraper() {
 
   // ─── Recruitment Data Loading ─────────────────────────────────────────
   const loadCandidates = async (search = "", tagF = tagFilter) => {
+    setCandidatesLoading(true);
     try {
       const params = new URLSearchParams();
       if (search) params.set("name", search);
@@ -749,6 +782,8 @@ export default function OutlookScraper() {
       if (!search && !tagF) setDbStats((prev) => ({ ...prev, candidates: data.length }));
     } catch (e) {
       notify("Failed to load candidates", "error");
+    } finally {
+      setCandidatesLoading(false);
     }
   };
 
@@ -850,6 +885,7 @@ export default function OutlookScraper() {
       const data = await res.json();
       setCandidateProfile(data);
       setSelectedCandidate(data);
+      profileNotesOriginalRef.current = data.notes || "";
     } catch (e) {
       notify(`Failed to load candidate profile: ${e.message}`, "error");
     } finally {
@@ -858,12 +894,15 @@ export default function OutlookScraper() {
   };
 
   const loadJobs = async () => {
+    setJobsLoading(true);
     try {
       const res = await fetch(`${API}/api/jobs`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setJobs(await res.json());
     } catch (e) {
       notify("Failed to load jobs", "error");
+    } finally {
+      setJobsLoading(false);
     }
   };
 
@@ -1168,6 +1207,8 @@ export default function OutlookScraper() {
         ::-webkit-scrollbar-thumb { background: ${theme.border}; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: ${theme.textDim}; }
         input, select { font-family: inherit; }
+        button:not(:disabled):hover { filter: brightness(1.15); }
+        button:not(:disabled):active { filter: brightness(0.95); }
       `}</style>
 
       {/* ─── Notification ─────────────────────────────────────────────── */}
@@ -1224,9 +1265,9 @@ export default function OutlookScraper() {
           {notifications.length === 0 ? (
             <div style={{
               padding: "40px 16px", textAlign: "center",
-              color: theme.textDim, fontSize: 12,
             }}>
-              No notifications yet
+              <div style={{ fontSize: 28, marginBottom: 8, opacity: 0.4 }}>🔔</div>
+              <div style={{ fontSize: 12, color: theme.textDim }}>You're all caught up!</div>
             </div>
           ) : (
             notifications.map((n) => {
@@ -1435,16 +1476,22 @@ export default function OutlookScraper() {
             { id: "jobs", icon: "💼", label: "Jobs & Match", action: () => { setView("jobs"); setSelectedEmail(null); loadJobs(); } },
             { id: "recruit-export", icon: "📤", label: "Recruit Export", action: () => { setView("recruit-export"); setSelectedEmail(null); loadJobs(); } },
             { id: "settings", icon: "⚙️", label: "Settings", action: () => { setView("settings"); setSelectedEmail(null); } },
-          ].map((item) => (
+          ].map((item) => {
+            const isActive = (view === item.id || (item.id === "candidates" && view === "candidateProfile")) && !activeFolder;
+            return (
             <button
               key={item.id}
               onClick={item.action}
+              onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = theme.surfaceHover; }}
+              onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
               style={{
                 display: "flex", alignItems: "center", gap: 10, width: "100%",
-                padding: sidebarOpen ? "8px 12px" : "8px", borderRadius: 6,
-                background: (view === item.id || (item.id === "candidates" && view === "candidateProfile")) && !activeFolder ? theme.accentGlow : "transparent",
-                border: "none", color: (view === item.id || (item.id === "candidates" && view === "candidateProfile")) && !activeFolder ? theme.accent : theme.textMuted,
-                cursor: "pointer", fontSize: 12, fontWeight: 500, textAlign: "left",
+                padding: sidebarOpen ? "8px 12px" : "8px", borderRadius: sidebarOpen ? "0 6px 6px 0" : 6,
+                background: isActive ? theme.accentGlow : "transparent",
+                border: "none",
+                borderLeft: sidebarOpen && isActive ? `3px solid ${theme.accent}` : sidebarOpen ? "3px solid transparent" : "none",
+                color: isActive ? theme.accent : theme.textMuted,
+                cursor: "pointer", fontSize: 12, fontWeight: isActive ? 600 : 500, textAlign: "left",
                 transition: "all 0.15s", justifyContent: sidebarOpen ? "flex-start" : "center",
               }}
             >
@@ -1459,7 +1506,8 @@ export default function OutlookScraper() {
                 </span>
               )}
             </button>
-          ))}
+          );
+          })}
 
           {sidebarOpen && (
             <>
@@ -1509,9 +1557,9 @@ export default function OutlookScraper() {
           }}>
             <span style={{ opacity: 0.6 }}>DB</span>
             <span>
-              {dbStats.candidates > 0 && `${dbStats.candidates} candidate${dbStats.candidates !== 1 ? "s" : ""}`}
+              {dbStats.candidates > 0 && `${fmtNum(dbStats.candidates)} candidate${dbStats.candidates !== 1 ? "s" : ""}`}
               {dbStats.candidates > 0 && dbStats.emails > 0 && " · "}
-              {dbStats.emails > 0 && `${dbStats.emails} email${dbStats.emails !== 1 ? "s" : ""} stored`}
+              {dbStats.emails > 0 && `${fmtNum(dbStats.emails)} email${dbStats.emails !== 1 ? "s" : ""} stored`}
             </span>
           </div>
         )}
@@ -2210,16 +2258,17 @@ export default function OutlookScraper() {
                               {/* Body Preview */}
                               {em.body && (
                                 <div style={{ margin: "12px 0", borderRadius: 6, overflow: "hidden" }}>
-                                  {em.body_type === "html" ? (
+                                  {isHtmlContent(em.body) ? (
                                     <SafeEmailBody html={em.body} />
                                   ) : (
-                                    <div style={{
-                                      padding: "12px 14px", borderRadius: 6,
+                                    <pre style={{
+                                      padding: "12px 14px", borderRadius: 6, margin: 0,
                                       background: theme.bg, fontSize: 11, color: theme.textMuted,
                                       lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                                      fontFamily: "inherit",
                                     }}>
-                                      {preview}{bodyText.length > 500 ? "..." : ""}
-                                    </div>
+                                      {em.body}
+                                    </pre>
                                   )}
                                 </div>
                               )}
@@ -2568,7 +2617,7 @@ export default function OutlookScraper() {
           };
           const getTagColor = (tag) => TAG_COLORS[tag.toLowerCase()] || theme.accent;
           return (
-          <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+          <div data-candidates-scroll style={{ flex: 1, overflowY: "auto", padding: 24 }}>
             <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, letterSpacing: -0.5 }}>
               Candidates
             </h2>
@@ -2625,26 +2674,36 @@ export default function OutlookScraper() {
             </span>
 
             {/* Table */}
-            {displayed.length === 0 ? (
-              <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
-                {showDuplicatesOnly
-                  ? "No duplicate candidates found."
-                  : tagFilter
-                    ? `No candidates with tag "${tagFilter}".`
-                    : (
-                      <div>
-                        <div style={{ marginBottom: 12 }}>No candidates yet — go to Scrape & Export to scan your inbox</div>
-                        <button
-                          onClick={() => { setView("scrape"); setSelectedEmail(null); }}
-                          style={{
-                            padding: "8px 20px", borderRadius: 8, fontSize: 12, fontWeight: 600,
-                            background: theme.accent, color: "#fff", border: "none", cursor: "pointer",
-                          }}
-                        >
-                          Go to Scrape & Export
-                        </button>
-                      </div>
-                    )}
+            {candidatesLoading && !candidates.length ? <Spinner /> : displayed.length === 0 ? (
+              <div style={{
+                padding: 60, textAlign: "center", borderRadius: 10,
+                background: theme.surface, border: `1px solid ${theme.border}`,
+              }}>
+                {showDuplicatesOnly ? (
+                  <div style={{ fontSize: 13, color: theme.textDim }}>No duplicate candidates found.</div>
+                ) : tagFilter ? (
+                  <div style={{ fontSize: 13, color: theme.textDim }}>No candidates with tag "{tagFilter}".</div>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.4 }}>👤</div>
+                    <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>No candidates yet</div>
+                    <div style={{ fontSize: 12, color: theme.textDim, lineHeight: 1.6, marginBottom: 20, maxWidth: 360, margin: "0 auto 20px" }}>
+                      Run a scrape in Scrape & Export to automatically extract candidates from recruitment emails.
+                    </div>
+                    <button
+                      onClick={() => { setView("scrape"); setSelectedEmail(null); }}
+                      onMouseEnter={(e) => { e.currentTarget.style.opacity = "0.85"; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; }}
+                      style={{
+                        padding: "10px 24px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        background: theme.accent, color: "#fff", border: "none", cursor: "pointer",
+                        transition: "opacity 0.15s",
+                      }}
+                    >
+                      Go to Scrape & Export
+                    </button>
+                  </>
+                )}
               </div>
             ) : (
               <div style={{ overflowX: "auto" }}>
@@ -2841,7 +2900,7 @@ export default function OutlookScraper() {
                               <div style={{ fontSize: 11, color: theme.textDim }}>
                                 Source UID: {c.source_email_uid || "\u2014"} &nbsp;|&nbsp;
                                 Titles: {(c.titles || []).join(", ") || "\u2014"} &nbsp;|&nbsp;
-                                Added: {c.created_at ? new Date(c.created_at).toLocaleDateString() : "\u2014"}
+                                Added: {c.created_at ? formatRelativeTime(c.created_at) : "\u2014"}
                               </div>
                               <button
                                 onClick={(e) => { e.stopPropagation(); openCandidateProfile(c.id); }}
@@ -2880,14 +2939,24 @@ export default function OutlookScraper() {
           const getTagColor = (tag) => TAG_COLORS[tag.toLowerCase()] || theme.accent;
           const bestMatch = (p?.match_history || []).length > 0 ? p.match_history[0] : null;
           const fitColors = { high: "#22c55e", medium: "#f59e0b", low: "#ef4444" };
-          const copyToClipboard = (text) => { navigator.clipboard.writeText(text); notify("Copied to clipboard", "success"); };
+          const copyToClipboard = (text, field) => {
+            navigator.clipboard.writeText(text);
+            setCopiedField(field);
+            setTimeout(() => setCopiedField(null), 2000);
+          };
 
           return (
           <div style={{ flex: 1, overflowY: "auto", padding: "24px 32px" }}>
             {/* Top Header Bar */}
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
               <button
-                onClick={() => { setView("candidates"); setSelectedCandidateId(null); setCandidateProfile(null); setSelectedCandidate(null); }}
+                onClick={() => {
+                  setView("candidates"); setSelectedCandidateId(null); setCandidateProfile(null); setSelectedCandidate(null);
+                  requestAnimationFrame(() => {
+                    const el = document.querySelector("[data-candidates-scroll]");
+                    if (el) el.scrollTop = 0;
+                  });
+                }}
                 style={{
                   padding: "6px 14px", borderRadius: 6, fontSize: 12, fontWeight: 500,
                   background: "transparent", border: `1px solid ${theme.border}`,
@@ -2937,13 +3006,17 @@ export default function OutlookScraper() {
                   {c.email && (
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                       <span style={{ fontSize: 12, color: theme.accent, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{c.email}</span>
-                      <span onClick={() => copyToClipboard(c.email)} style={{ cursor: "pointer", fontSize: 13, opacity: 0.5, marginLeft: 8, flexShrink: 0 }} title="Copy email">📋</span>
+                      <span onClick={() => copyToClipboard(c.email, "email")} style={{ cursor: "pointer", fontSize: copiedField === "email" ? 10 : 13, opacity: copiedField === "email" ? 1 : 0.5, marginLeft: 8, flexShrink: 0, color: copiedField === "email" ? theme.success : "inherit", fontWeight: copiedField === "email" ? 600 : "normal", transition: "all 0.15s" }} title="Copy email">
+                        {copiedField === "email" ? "Copied!" : "📋"}
+                      </span>
                     </div>
                   )}
                   {c.phone && (
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                       <span style={{ fontSize: 12, color: theme.text }}>{c.phone}</span>
-                      <span onClick={() => copyToClipboard(c.phone)} style={{ cursor: "pointer", fontSize: 13, opacity: 0.5, marginLeft: 8, flexShrink: 0 }} title="Copy phone">📋</span>
+                      <span onClick={() => copyToClipboard(c.phone, "phone")} style={{ cursor: "pointer", fontSize: copiedField === "phone" ? 10 : 13, opacity: copiedField === "phone" ? 1 : 0.5, marginLeft: 8, flexShrink: 0, color: copiedField === "phone" ? theme.success : "inherit", fontWeight: copiedField === "phone" ? 600 : "normal", transition: "all 0.15s" }} title="Copy phone">
+                        {copiedField === "phone" ? "Copied!" : "📋"}
+                      </span>
                     </div>
                   )}
                   {c.location && (
@@ -2966,7 +3039,7 @@ export default function OutlookScraper() {
                         background: "rgba(20,184,166,0.15)", color: "#14b8a6",
                         textTransform: "uppercase", letterSpacing: 0.3,
                       }}>{s}</span>
-                    )) : <span style={{ fontSize: 11, color: theme.textDim }}>No skills extracted</span>}
+                    )) : <span style={{ fontSize: 11, color: theme.textDim, fontStyle: "italic" }}>No skills extracted</span>}
                   </div>
                 </div>
 
@@ -2976,7 +3049,7 @@ export default function OutlookScraper() {
                     Experience
                   </div>
                   <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
-                    {c.years_exp != null ? `${c.years_exp} years` : "Not specified"}
+                    {c.years_exp ? `${c.years_exp} years` : <span style={{ fontSize: 12, fontWeight: 400, color: theme.textDim, fontStyle: "italic" }}>Experience not extracted</span>}
                   </div>
                   {(c.titles || []).length > 0 && (
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -3078,10 +3151,11 @@ export default function OutlookScraper() {
                     onChange={(e) => setCandidateNotesDraft((pr) => ({ ...pr, [c.id]: e.target.value }))}
                     onBlur={() => {
                       const draft = candidateNotesDraft[c.id];
-                      if (draft !== undefined && draft !== (c.notes || "")) {
+                      if (draft !== undefined && draft !== profileNotesOriginalRef.current) {
                         saveCandidateNotes(c.id, draft);
                         setCandidateProfile((prev) => prev ? { ...prev, notes: draft } : prev);
                         setSelectedCandidate((prev) => prev ? { ...prev, notes: draft } : prev);
+                        profileNotesOriginalRef.current = draft;
                         setProfileNotesSaved(true);
                         setTimeout(() => setProfileNotesSaved(false), 2000);
                       }
@@ -3126,10 +3200,16 @@ export default function OutlookScraper() {
                 {/* Loading state */}
                 {profileLoading && (
                   <div style={{
-                    padding: 40, textAlign: "center", borderRadius: 10,
+                    padding: 60, textAlign: "center", borderRadius: 10,
                     background: theme.surface, border: `1px solid ${theme.border}`,
+                    display: "flex", flexDirection: "column", alignItems: "center", gap: 16,
                   }}>
-                    <div style={{ fontSize: 13, color: theme.textDim, animation: "pulse 1.5s infinite" }}>Loading profile data...</div>
+                    <div style={{
+                      width: 32, height: 32, border: `3px solid ${theme.border}`,
+                      borderTopColor: theme.accent, borderRadius: "50%",
+                      animation: "spin 0.8s linear infinite",
+                    }} />
+                    <div style={{ fontSize: 13, color: theme.textDim }}>Loading profile...</div>
                   </div>
                 )}
 
@@ -3147,8 +3227,12 @@ export default function OutlookScraper() {
                         {p.resume_text}
                       </pre>
                     ) : (
-                      <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
-                        {p ? "No resume text available" : "Loading..."}
+                      <div style={{ padding: 48, textAlign: "center" }}>
+                        <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.5 }}>📄</div>
+                        <div style={{ fontSize: 13, color: theme.textDim, lineHeight: 1.6 }}>
+                          No resume text available.<br />
+                          <span style={{ fontSize: 11, color: theme.textDim, opacity: 0.7 }}>The resume file may be in an unsupported format.</span>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -3193,7 +3277,7 @@ export default function OutlookScraper() {
                                   {m.fit_level}
                                 </td>
                                 <td style={{ padding: "10px 14px", color: theme.textDim }}>
-                                  {m.matched_at ? new Date(m.matched_at).toLocaleDateString() : "\u2014"}
+                                  {m.matched_at ? formatRelativeTime(m.matched_at) : "\u2014"}
                                 </td>
                               </tr>
                               {expandedMatchIdx === i && (
@@ -3215,8 +3299,12 @@ export default function OutlookScraper() {
                         </tbody>
                       </table>
                     ) : (
-                      <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
-                        {p ? "No match runs yet \u2014 go to Jobs & Match to run matching" : "Loading..."}
+                      <div style={{ padding: 48, textAlign: "center" }}>
+                        <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.5 }}>🎯</div>
+                        <div style={{ fontSize: 13, color: theme.textDim, lineHeight: 1.6 }}>
+                          No matches yet.<br />
+                          <span style={{ fontSize: 11, color: theme.textDim, opacity: 0.7 }}>Create a job in Jobs & Match and run matching to see results here.</span>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -3239,18 +3327,39 @@ export default function OutlookScraper() {
                             {p.source_email.date ? new Date(p.source_email.date).toLocaleString() : "\u2014"}
                           </span>
                         </div>
-                        <div style={{
-                          maxHeight: 400, overflowY: "auto", padding: 16, borderRadius: 8,
-                          background: theme.bg, border: `1px solid ${theme.border}`,
-                          fontSize: 12, lineHeight: 1.6, color: theme.textMuted,
-                          whiteSpace: "pre-wrap", wordBreak: "break-word",
-                        }}>
-                          {p.source_email.body_text || "(No body text)"}
+                        <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                          {p.source_email.body_text ? (
+                            isHtmlContent(p.source_email.body_text) ? (
+                              <SafeEmailBody html={p.source_email.body_text} />
+                            ) : (
+                              <pre style={{
+                                padding: 16, borderRadius: 8, margin: 0,
+                                background: theme.bg, border: `1px solid ${theme.border}`,
+                                fontSize: 12, lineHeight: 1.6, color: theme.textMuted,
+                                whiteSpace: "pre-wrap", wordBreak: "break-word",
+                                fontFamily: "inherit",
+                              }}>
+                                {p.source_email.body_text}
+                              </pre>
+                            )
+                          ) : (
+                            <div style={{
+                              padding: 16, borderRadius: 8,
+                              background: theme.bg, border: `1px solid ${theme.border}`,
+                              fontSize: 12, color: theme.textDim, textAlign: "center",
+                            }}>
+                              (No body text)
+                            </div>
+                          )}
                         </div>
                       </div>
                     ) : (
-                      <div style={{ padding: 40, textAlign: "center", color: theme.textDim, fontSize: 13 }}>
-                        {p ? "Source email not available" : "Loading..."}
+                      <div style={{ padding: 48, textAlign: "center" }}>
+                        <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.5 }}>📧</div>
+                        <div style={{ fontSize: 13, color: theme.textDim, lineHeight: 1.6 }}>
+                          Source email not found.<br />
+                          <span style={{ fontSize: 11, color: theme.textDim, opacity: 0.7 }}>This candidate may have been added manually.</span>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -3417,9 +3526,14 @@ export default function OutlookScraper() {
               }}>
                 Saved Jobs ({jobs.length})
               </div>
-              {jobs.length === 0 ? (
-                <div style={{ padding: 20, textAlign: "center", color: theme.textDim, fontSize: 11 }}>
-                  No jobs yet. Create one above.
+              {jobsLoading && !jobs.length ? <Spinner /> : jobs.length === 0 ? (
+                <div style={{
+                  padding: 40, textAlign: "center", borderRadius: 8,
+                  background: theme.bg, border: `1px solid ${theme.border}`,
+                }}>
+                  <div style={{ fontSize: 32, marginBottom: 8, opacity: 0.4 }}>💼</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>No jobs created yet</div>
+                  <div style={{ fontSize: 11, color: theme.textDim }}>Paste a job description above to get started.</div>
                 </div>
               ) : jobs.map((j) => (
                 <div
@@ -3612,7 +3726,7 @@ export default function OutlookScraper() {
             : h?.health_status === "warning" ? "#f59e0b" : "#ef4444";
           const statusLabel = h?.health_status === "healthy" ? "Healthy"
             : h?.health_status === "warning" ? "Warning" : "Empty";
-          const typeColors = { pdf: "#ef4444", docx: "#3b82f6", doc: "#60a5fa", image: "#22c55e", other: "#6b7280" };
+          const typeColors = { pdf: "#ef4444", docx: "#3b82f6", doc: "#3b82f6", image: "#22c55e", other: "#6b7280" };
 
           return (
           <div style={{ flex: 1, overflowY: "auto", padding: 24, maxWidth: 900, margin: "0 auto" }}>
@@ -3918,20 +4032,29 @@ export default function OutlookScraper() {
                   </div>
                   {/* Type breakdown bar */}
                   {h.attachments.total_files > 0 && (() => {
-                    const types = h.attachments.by_type;
-                    const segments = Object.entries(types).sort((a, b) => b[1] - a[1]);
+                    const types = h.attachments.by_type || {};
+                    const labelMap = { pdf: "PDF", docx: "DOCX", doc: "DOCX", image: "IMG", other: "Other" };
+                    // Merge doc into docx for display
+                    const merged = {};
+                    for (const [k, v] of Object.entries(types)) {
+                      const label = labelMap[k] || "Other";
+                      merged[label] = (merged[label] || 0) + v;
+                    }
+                    const order = ["PDF", "DOCX", "IMG", "Other"];
+                    const colorMap = { PDF: "#ef4444", DOCX: "#3b82f6", IMG: "#22c55e", Other: "#6b7280" };
+                    const segments = order.filter((k) => merged[k] > 0).map((k) => [k, merged[k]]);
                     return (
                       <div>
-                        <div style={{ display: "flex", width: "100%", height: 10, borderRadius: 6, overflow: "hidden", marginBottom: 8 }}>
-                          {segments.map(([type, count]) => (
-                            <div key={type} style={{
+                        <div style={{ display: "flex", width: "100%", height: 10, borderRadius: 6, overflow: "hidden", marginBottom: 8, background: theme.border }}>
+                          {segments.map(([label, count]) => (
+                            <div key={label} style={{
                               flex: count,
-                              background: typeColors[type] || typeColors.other,
+                              background: colorMap[label] || colorMap.Other,
                             }} />
                           ))}
                         </div>
                         <div style={{ fontSize: 11, color: theme.textDim }}>
-                          {segments.filter(([, c]) => c > 0).map(([type, count]) => `${count} ${type.toUpperCase()}`).join(" · ")}
+                          {segments.map(([label, count]) => `${count} ${label}`).join(" · ")}
                         </div>
                       </div>
                     );
