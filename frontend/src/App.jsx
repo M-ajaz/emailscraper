@@ -204,6 +204,8 @@ export default function OutlookScraper() {
   const [auth, setAuth] = useState({ loading: true, authenticated: false, user: null });
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [loginLoading, setLoginLoading] = useState(false);
+  const [authMethod, setAuthMethod] = useState("imap"); // "imap" or "oauth2"
+  const [msLoginLoading, setMsLoginLoading] = useState(false);
   const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments | candidates | candidateProfile | jobs | recruit-export | settings
   const [folders, setFolders] = useState([]);
   const [emails, setEmails] = useState([]);
@@ -269,9 +271,106 @@ export default function OutlookScraper() {
   const [schedulerRunNow, setSchedulerRunNow] = useState(false);
   const [schedulerCountdown, setSchedulerCountdown] = useState(null);
 
+  // ─── Notification System State ──────────────────────────────────────
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notifDropdownOpen, setNotifDropdownOpen] = useState(false);
+  const [toasts, setToasts] = useState([]);
+  const notifBellRef = useRef(null);
+  const notifDropdownRef = useRef(null);
+  const prevUnreadCountRef = useRef(0);
+
   const notify = (msg, type = "info") => {
     setNotification({ msg, type });
     setTimeout(() => setNotification(null), 4000);
+  };
+
+  // ─── Notification System Functions ──────────────────────────────────
+  const loadNotificationCount = async () => {
+    try {
+      const res = await fetch(`${API}/api/notifications/count`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const newCount = data.unread_count ?? data.count ?? 0;
+      setUnreadCount((prev) => {
+        prevUnreadCountRef.current = prev;
+        return newCount;
+      });
+      return newCount;
+    } catch (_) { /* silent */ }
+  };
+
+  const loadNotifications = async () => {
+    try {
+      const res = await fetch(`${API}/api/notifications?limit=20`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setNotifications(Array.isArray(data) ? data : data.notifications || []);
+    } catch (_) { /* silent */ }
+  };
+
+  const showToast = (message, type = "info") => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 5000);
+  };
+
+  // ─── Poll notification count every 60s ──────────────────────────────
+  useEffect(() => {
+    loadNotificationCount();
+    const interval = setInterval(async () => {
+      const newCount = await loadNotificationCount();
+      if (newCount != null && newCount > prevUnreadCountRef.current) {
+        // New notifications arrived — fetch and toast high_fit ones
+        try {
+          const res = await fetch(`${API}/api/notifications?limit=10`);
+          if (res.ok) {
+            const data = await res.json();
+            const items = Array.isArray(data) ? data : data.notifications || [];
+            items
+              .filter((n) => !n.is_read && n.type === "new_high_fit")
+              .slice(0, 3)
+              .forEach((n) => showToast(n.message || n.title, "new_high_fit"));
+          }
+        } catch (_) { /* silent */ }
+      }
+    }, 60000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ─── Load notifications when dropdown opens ─────────────────────────
+  useEffect(() => {
+    if (notifDropdownOpen) loadNotifications();
+  }, [notifDropdownOpen]);
+
+  // ─── Close dropdown on outside click ────────────────────────────────
+  useEffect(() => {
+    if (!notifDropdownOpen) return;
+    const handleClick = (e) => {
+      if (
+        notifDropdownRef.current && !notifDropdownRef.current.contains(e.target) &&
+        notifBellRef.current && !notifBellRef.current.contains(e.target)
+      ) {
+        setNotifDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [notifDropdownOpen]);
+
+  const formatRelativeTime = (iso) => {
+    if (!iso) return "";
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "Just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days < 7) return `${days}d ago`;
+    return `${Math.floor(days / 7)}w ago`;
   };
 
   // ─── Pre-load cached data from SQLite on mount ─────────────────────────
@@ -302,7 +401,33 @@ export default function OutlookScraper() {
 
   // ─── Auth ───────────────────────────────────────────────────────────────
   useEffect(() => {
-    checkAuth();
+    // Check for OAuth2 redirect callback
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("auth") === "success") {
+      window.history.replaceState({}, "", window.location.pathname);
+      (async () => {
+        try {
+          const msRes = await fetch(`${API}/auth/microsoft/status`);
+          if (msRes.ok) {
+            const msData = await msRes.json();
+            if (msData.connected) {
+              setAuthMethod("oauth2");
+              const email = msData.email || params.get("email") || "";
+              setAuth({
+                loading: false, authenticated: true,
+                user: { name: email.split("@")[0], email },
+              });
+              loadFolders();
+              loadEmails();
+              return;
+            }
+          }
+        } catch (_) {}
+        checkAuth();
+      })();
+    } else {
+      checkAuth();
+    }
   }, []);
 
   // ─── Auto-refresh storage health every 30s when on settings view ────────
@@ -342,11 +467,29 @@ export default function OutlookScraper() {
       const res = await fetch(`${API}/auth/status`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      setAuth({ loading: false, ...data });
       if (data.authenticated) {
+        setAuth({ loading: false, ...data });
+        setAuthMethod("imap");
         loadFolders();
         loadEmails();
+        return;
       }
+      // Check Microsoft OAuth2 session
+      const msRes = await fetch(`${API}/auth/microsoft/status`).catch(() => null);
+      if (msRes && msRes.ok) {
+        const msData = await msRes.json();
+        if (msData.connected) {
+          setAuthMethod("oauth2");
+          setAuth({
+            loading: false, authenticated: true,
+            user: { name: msData.email.split("@")[0], email: msData.email },
+          });
+          loadFolders();
+          loadEmails();
+          return;
+        }
+      }
+      setAuth({ loading: false, authenticated: false, user: null });
     } catch (e) {
       setAuth({ loading: false, authenticated: false, user: null });
       setError("Cannot connect to backend server");
@@ -367,6 +510,7 @@ export default function OutlookScraper() {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || `HTTP ${res.status}`);
       }
+      setAuthMethod("imap");
       await checkAuth();
     } catch (err) {
       setError(err.message || "Login failed. Check your credentials.");
@@ -375,9 +519,34 @@ export default function OutlookScraper() {
     setLoginLoading(false);
   };
 
+  const handleMicrosoftLogin = async () => {
+    setMsLoginLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API}/auth/microsoft/url`);
+      const data = await res.json();
+      if (data.error) {
+        setError(data.error);
+        setMsLoginLoading(false);
+        return;
+      }
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    } catch (err) {
+      setError("Failed to start Microsoft login");
+      setMsLoginLoading(false);
+    }
+  };
+
   const logout = async () => {
-    await fetch(`${API}/auth/logout`, { method: "POST" });
+    if (authMethod === "oauth2") {
+      await fetch(`${API}/auth/microsoft/logout`, { method: "POST" });
+    } else {
+      await fetch(`${API}/auth/logout`, { method: "POST" });
+    }
     setAuth({ loading: false, authenticated: false, user: null });
+    setAuthMethod("imap");
     setEmails([]);
     setFolders([]);
     setSelectedEmail(null);
@@ -923,6 +1092,49 @@ export default function OutlookScraper() {
             {loginLoading ? "Connecting..." : "Sign In"}
           </button>
         </form>
+
+        {/* OR divider */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: 12,
+          margin: "24px 0",
+        }}>
+          <div style={{ flex: 1, height: 1, background: theme.border }} />
+          <span style={{ fontSize: 11, color: theme.textDim, fontWeight: 600, letterSpacing: 1 }}>OR</span>
+          <div style={{ flex: 1, height: 1, background: theme.border }} />
+        </div>
+
+        {/* Microsoft OAuth2 Login */}
+        <button
+          onClick={handleMicrosoftLogin}
+          disabled={msLoginLoading}
+          style={{
+            width: "100%", display: "flex", alignItems: "center", justifyContent: "center",
+            gap: 10, padding: "11px 20px", borderRadius: 8, fontSize: 13, fontWeight: 600,
+            background: "#f0f0f0", color: "#1a1a1a", border: "1px solid #ccc",
+            cursor: msLoginLoading ? "not-allowed" : "pointer",
+            opacity: msLoginLoading ? 0.7 : 1,
+            transition: "all 0.2s",
+          }}
+          onMouseEnter={(e) => { if (!msLoginLoading) e.currentTarget.style.background = "#e0e0e0"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "#f0f0f0"; }}
+        >
+          {msLoginLoading ? (
+            <div style={{
+              width: 16, height: 16, border: "2px solid #ccc",
+              borderTopColor: "#333", borderRadius: "50%",
+              animation: "spin 0.8s linear infinite",
+            }} />
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 21 21">
+              <rect x="1" y="1" width="9" height="9" fill="#f25022" />
+              <rect x="11" y="1" width="9" height="9" fill="#7fba00" />
+              <rect x="1" y="11" width="9" height="9" fill="#00a4ef" />
+              <rect x="11" y="11" width="9" height="9" fill="#ffb900" />
+            </svg>
+          )}
+          {msLoginLoading ? "Redirecting..." : "Sign in with Microsoft"}
+        </button>
+
         <div style={{ marginTop: 20, fontSize: 11, color: theme.textDim, lineHeight: 1.6 }}>
           Works with Outlook.com, Hotmail, and Microsoft 365 accounts
           <br />
@@ -949,6 +1161,7 @@ export default function OutlookScraper() {
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes slideIn { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:translateY(0); } }
         @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+        @keyframes toastIn { from { opacity:0; transform:translateX(40px); } to { opacity:1; transform:translateX(0); } }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -968,6 +1181,138 @@ export default function OutlookScraper() {
           color: "#fff", boxShadow: "0 8px 30px rgba(0,0,0,0.4)",
         }}>
           {notification.msg}
+        </div>
+      )}
+
+      {/* ─── Notification Dropdown ────────────────────────────────────── */}
+      {notifDropdownOpen && (
+        <div
+          ref={notifDropdownRef}
+          style={{
+            position: "fixed", top: 52, left: sidebarOpen ? 120 : 10,
+            width: 360, maxHeight: 480, overflowY: "auto",
+            background: theme.surface, border: `1px solid ${theme.border}`,
+            borderRadius: 10, boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+            zIndex: 2000, animation: "slideIn 0.2s ease",
+            display: "flex", flexDirection: "column",
+          }}
+        >
+          {/* Dropdown Header */}
+          <div style={{
+            padding: "12px 16px", borderBottom: `1px solid ${theme.border}`,
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+          }}>
+            <span style={{ fontWeight: 700, fontSize: 13, color: theme.text }}>Notifications</span>
+            <button
+              onClick={async () => {
+                try {
+                  await fetch(`${API}/api/notifications/read-all`, { method: "PATCH" });
+                  setUnreadCount(0);
+                  loadNotifications();
+                } catch (_) {}
+              }}
+              style={{
+                background: "none", border: "none", color: theme.accent,
+                cursor: "pointer", fontSize: 11, fontWeight: 500,
+              }}
+            >
+              Mark all read
+            </button>
+          </div>
+
+          {/* Notification Items */}
+          {notifications.length === 0 ? (
+            <div style={{
+              padding: "40px 16px", textAlign: "center",
+              color: theme.textDim, fontSize: 12,
+            }}>
+              No notifications yet
+            </div>
+          ) : (
+            notifications.map((n) => {
+              const typeIcon = n.type === "new_high_fit" ? "🎯"
+                : n.type === "new_candidate" ? "👤"
+                : n.type === "scrape_complete" ? "📧" : "🔔";
+              return (
+                <div
+                  key={n.id}
+                  onClick={async () => {
+                    if (!n.is_read) {
+                      try {
+                        await fetch(`${API}/api/notifications/${n.id}/read`, { method: "PATCH" });
+                      } catch (_) {}
+                      setNotifications((prev) =>
+                        prev.map((x) => x.id === n.id ? { ...x, is_read: true } : x)
+                      );
+                      setUnreadCount((c) => Math.max(0, c - 1));
+                    }
+                    setNotifDropdownOpen(false);
+                    if (n.type === "new_high_fit") setView("jobs");
+                    else if (n.type === "new_candidate") setView("candidates");
+                  }}
+                  style={{
+                    padding: "10px 16px", cursor: "pointer",
+                    background: n.is_read ? "transparent" : `${theme.accent}08`,
+                    borderBottom: `1px solid ${theme.border}`,
+                    display: "flex", gap: 10, alignItems: "flex-start",
+                    transition: "background 0.15s", position: "relative",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = theme.surfaceHover; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = n.is_read ? "transparent" : `${theme.accent}08`; }}
+                >
+                  {!n.is_read && (
+                    <div style={{
+                      position: "absolute", left: 6, top: "50%", transform: "translateY(-50%)",
+                      width: 6, height: 6, borderRadius: "50%", background: theme.accent,
+                    }} />
+                  )}
+                  <span style={{ fontSize: 16, flexShrink: 0, marginTop: 2 }}>{typeIcon}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{
+                      fontSize: 12, fontWeight: 600, color: theme.text,
+                      whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                    }}>
+                      {n.title}
+                    </div>
+                    <div style={{
+                      fontSize: 11, color: theme.textMuted, marginTop: 2,
+                      display: "-webkit-box", WebkitLineClamp: 2,
+                      WebkitBoxOrient: "vertical", overflow: "hidden",
+                      lineHeight: 1.4,
+                    }}>
+                      {n.message}
+                    </div>
+                    <div style={{
+                      fontSize: 10, color: theme.textDim, marginTop: 4, textAlign: "right",
+                    }}>
+                      {formatRelativeTime(n.created_at)}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+
+          {/* Dropdown Footer */}
+          <div style={{
+            padding: "10px 16px", borderTop: `1px solid ${theme.border}`,
+            textAlign: "center",
+          }}>
+            <button
+              onClick={async () => {
+                try {
+                  await fetch(`${API}/api/notifications/clear?mode=read`, { method: "DELETE" });
+                  loadNotifications();
+                } catch (_) {}
+              }}
+              style={{
+                background: "none", border: "none", color: theme.textDim,
+                cursor: "pointer", fontSize: 11,
+              }}
+            >
+              Clear read notifications
+            </button>
+          </div>
         </div>
       )}
 
@@ -994,9 +1339,59 @@ export default function OutlookScraper() {
             {sidebarOpen ? "◀" : "▶"}
           </button>
           {sidebarOpen && (
-            <span style={{ fontWeight: 700, fontSize: 14, letterSpacing: -0.5, whiteSpace: "nowrap" }}>
-              📧 Mail Scraper
-            </span>
+            <>
+              <span style={{ fontWeight: 700, fontSize: 14, letterSpacing: -0.5, whiteSpace: "nowrap", flex: 1 }}>
+                📧 Mail Scraper
+              </span>
+              <button
+                ref={notifBellRef}
+                onClick={() => setNotifDropdownOpen((v) => !v)}
+                style={{
+                  background: "none", border: "none", cursor: "pointer",
+                  position: "relative", fontSize: 16, padding: 4, flexShrink: 0,
+                  color: theme.textMuted, lineHeight: 1,
+                }}
+              >
+                🔔
+                {unreadCount > 0 && (
+                  <span style={{
+                    position: "absolute", top: -2, right: -4,
+                    background: theme.danger, color: "#fff",
+                    fontSize: 9, fontWeight: 700, minWidth: 16, height: 16,
+                    borderRadius: 8, display: "flex", alignItems: "center",
+                    justifyContent: "center", padding: "0 3px",
+                    lineHeight: 1, border: `2px solid ${theme.surface}`,
+                  }}>
+                    {unreadCount > 9 ? "9+" : unreadCount}
+                  </span>
+                )}
+              </button>
+            </>
+          )}
+          {!sidebarOpen && (
+            <button
+              ref={notifBellRef}
+              onClick={() => setNotifDropdownOpen((v) => !v)}
+              style={{
+                background: "none", border: "none", cursor: "pointer",
+                position: "relative", fontSize: 14, padding: 4, flexShrink: 0,
+                color: theme.textMuted, lineHeight: 1,
+              }}
+            >
+              🔔
+              {unreadCount > 0 && (
+                <span style={{
+                  position: "absolute", top: -2, right: -4,
+                  background: theme.danger, color: "#fff",
+                  fontSize: 8, fontWeight: 700, minWidth: 14, height: 14,
+                  borderRadius: 7, display: "flex", alignItems: "center",
+                  justifyContent: "center", padding: "0 2px",
+                  lineHeight: 1, border: `2px solid ${theme.surface}`,
+                }}>
+                  {unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              )}
+            </button>
           )}
         </div>
 
@@ -1006,9 +1401,26 @@ export default function OutlookScraper() {
             <div style={{ fontSize: 12, fontWeight: 600, color: theme.text, marginBottom: 2 }}>
               {auth.user.name}
             </div>
-            <div style={{ fontSize: 10, color: theme.textDim, wordBreak: "break-all" }}>
+            <div style={{ fontSize: 10, color: theme.textDim, wordBreak: "break-all", marginBottom: 6 }}>
               {auth.user.email}
             </div>
+            <span style={{
+              display: "inline-flex", alignItems: "center", gap: 4,
+              padding: "2px 7px", borderRadius: 4, fontSize: 9, fontWeight: 600,
+              letterSpacing: 0.3, textTransform: "uppercase",
+              background: authMethod === "oauth2" ? `${theme.accent}20` : `${theme.textDim}20`,
+              color: authMethod === "oauth2" ? theme.accent : theme.textDim,
+            }}>
+              {authMethod === "oauth2" && (
+                <svg width="10" height="10" viewBox="0 0 21 21" style={{ flexShrink: 0 }}>
+                  <rect x="1" y="1" width="9" height="9" fill="#f25022" />
+                  <rect x="11" y="1" width="9" height="9" fill="#7fba00" />
+                  <rect x="1" y="11" width="9" height="9" fill="#00a4ef" />
+                  <rect x="11" y="11" width="9" height="9" fill="#ffb900" />
+                </svg>
+              )}
+              {authMethod === "oauth2" ? "Microsoft" : "IMAP"}
+            </span>
           </div>
         )}
 
@@ -3804,6 +4216,48 @@ export default function OutlookScraper() {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ─── Toast Notifications ─────────────────────────────────────── */}
+      {toasts.length > 0 && (
+        <div style={{
+          position: "fixed", bottom: 20, right: 20, zIndex: 3000,
+          display: "flex", flexDirection: "column-reverse", gap: 8,
+          pointerEvents: "none",
+        }}>
+          {toasts.map((t) => {
+            const borderColor = t.type === "new_high_fit" ? theme.success
+              : t.type === "new_candidate" ? theme.accent : theme.textDim;
+            const icon = t.type === "new_high_fit" ? "🎯"
+              : t.type === "new_candidate" ? "👤" : "📧";
+            return (
+              <div
+                key={t.id}
+                style={{
+                  background: theme.surface, border: `1px solid ${theme.border}`,
+                  borderLeft: `4px solid ${borderColor}`,
+                  borderRadius: 8, padding: "10px 14px",
+                  boxShadow: "0 8px 30px rgba(0,0,0,0.4)",
+                  display: "flex", alignItems: "center", gap: 10,
+                  animation: "toastIn 0.3s ease",
+                  minWidth: 260, maxWidth: 360, pointerEvents: "auto",
+                }}
+              >
+                <span style={{ fontSize: 16, flexShrink: 0 }}>{icon}</span>
+                <span style={{ fontSize: 12, color: theme.text, flex: 1 }}>{t.message}</span>
+                <button
+                  onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+                  style={{
+                    background: "none", border: "none", color: theme.textDim,
+                    cursor: "pointer", fontSize: 14, flexShrink: 0, padding: 2,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

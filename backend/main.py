@@ -43,6 +43,8 @@ from database import (
 from parsers import extract_text_from_pdf, extract_text_from_docx, extract_entities
 from pipeline import process_attachment_into_candidate
 from matcher import run_match, _candidate_to_dict, _job_to_dict
+import graph_client
+import requests as http_requests
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -156,12 +158,17 @@ _imap_lock = asyncio.Lock()
 
 
 def _save_session():
-    """Persist current credentials to .session.json."""
+    """Persist current IMAP credentials to .session.json, preserving other keys."""
     try:
-        SESSION_FILE.write_text(json.dumps({
-            "email": _credentials.get("email", ""),
-            "password": _credentials.get("password", ""),
-        }))
+        data = {}
+        if SESSION_FILE.exists():
+            try:
+                data = json.loads(SESSION_FILE.read_text())
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        data["email"] = _credentials.get("email", "")
+        data["password"] = _credentials.get("password", "")
+        SESSION_FILE.write_text(json.dumps(data))
     except Exception:
         logger.exception("Failed to save session file")
 
@@ -181,6 +188,18 @@ def _restore_session():
         return
     try:
         data = json.loads(SESSION_FILE.read_text())
+
+        # Check for OAuth2 session first
+        if data.get("microsoft_tokens"):
+            token = graph_client.get_valid_token()
+            if token:
+                email_addr = data["microsoft_tokens"].get("email", "")
+                _credentials["email"] = email_addr
+                _credentials["auth_method"] = "oauth2"
+                logger.info("OAuth2 session restored for %s", email_addr)
+                return
+
+        # Fall back to IMAP credentials
         em = data.get("email", "")
         pw = data.get("password", "")
         if not em or not pw:
@@ -190,11 +209,25 @@ def _restore_session():
         conn.login(em, pw)
         _credentials["email"] = em
         _credentials["password"] = pw
+        _credentials["auth_method"] = "imap"
         _imap_connection = conn
-        logger.info("Session restored for %s", em)
+        logger.info("IMAP session restored for %s", em)
     except Exception:
         logger.warning("Session restore failed — credentials may be stale")
         _clear_session()
+
+
+def get_auth_method() -> str:
+    """Return current auth method: 'imap', 'oauth2', or 'none'."""
+    method = _credentials.get("auth_method", "")
+    if method:
+        return method
+    # Infer from credentials state
+    if _credentials.get("password"):
+        return "imap"
+    if graph_client.get_tokens():
+        return "oauth2"
+    return "none"
 
 
 # ─── IMAP Connection Management ─────────────────────────────────────────────
@@ -842,6 +875,7 @@ async def login(request: LoginRequest):
 
     _credentials["email"] = request.email
     _credentials["password"] = request.password
+    _credentials["auth_method"] = "imap"
     _save_session()
     return {"message": "Login successful", "email": request.email}
 
@@ -850,6 +884,16 @@ async def login(request: LoginRequest):
 async def auth_status():
     if _credentials.get("email"):
         addr = _credentials["email"]
+        return AuthStatus(
+            authenticated=True,
+            user=UserInfo(name=addr.split("@")[0], email=addr),
+        )
+    # Also check for OAuth2 tokens on disk even if not in memory yet
+    tokens = graph_client.get_tokens()
+    if tokens and tokens.get("email"):
+        addr = tokens["email"]
+        _credentials["email"] = addr
+        _credentials["auth_method"] = "oauth2"
         return AuthStatus(
             authenticated=True,
             user=UserInfo(name=addr.split("@")[0], email=addr),
@@ -869,6 +913,131 @@ async def logout():
     _credentials.clear()
     _clear_session()
     return LogoutResponse(message="Logged out successfully")
+
+
+# ─── Microsoft OAuth2 Endpoints ─────────────────────────────────────────────
+
+@app.get("/auth/microsoft/url")
+async def microsoft_auth_url():
+    """Build Microsoft OAuth2 authorization URL."""
+    client_id = os.getenv("MICROSOFT_CLIENT_ID", "")
+    if not client_id:
+        return {"error": "MICROSOFT_CLIENT_ID not configured in .env"}
+    authority = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    redirect_uri = "http://localhost:8000/auth/microsoft/callback"
+    scope = "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access User.Read"
+    params = (
+        f"client_id={client_id}"
+        f"&response_type=code"
+        f"&redirect_uri={redirect_uri}"
+        f"&scope={scope}"
+        f"&response_mode=query"
+    )
+    return {"url": f"{authority}?{params}"}
+
+
+@app.get("/auth/microsoft/callback")
+async def microsoft_auth_callback(code: str = ""):
+    """Exchange authorization code for tokens, then redirect to frontend."""
+    from fastapi.responses import RedirectResponse
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+
+    client_id = os.getenv("MICROSOFT_CLIENT_ID", "")
+    if not client_id:
+        raise HTTPException(status_code=500, detail="MICROSOFT_CLIENT_ID not configured")
+
+    redirect_uri = "http://localhost:8000/auth/microsoft/callback"
+    scope = "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access User.Read"
+    token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+    # Exchange code for tokens
+    try:
+        resp = http_requests.post(token_url, data={
+            "client_id": client_id,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "scope": scope,
+        }, timeout=15)
+        resp.raise_for_status()
+        token_data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token exchange failed: {e}")
+
+    access_token = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+    expires_in = token_data.get("expires_in", 3600)
+    expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat()
+
+    # Get user profile
+    user_email = ""
+    try:
+        me_resp = http_requests.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        if me_resp.ok:
+            me_data = me_resp.json()
+            user_email = me_data.get("mail") or me_data.get("userPrincipalName", "")
+    except Exception:
+        pass
+
+    # Save tokens to .session.json
+    graph_client.save_tokens({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "access_token_expires_at": expires_at,
+        "email": user_email,
+    })
+
+    # Update session file with auth_method
+    try:
+        data = json.loads(SESSION_FILE.read_text()) if SESSION_FILE.exists() else {}
+        data["auth_method"] = "oauth2"
+        SESSION_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+    # Set in-memory credentials
+    _credentials["email"] = user_email
+    _credentials["auth_method"] = "oauth2"
+
+    return RedirectResponse(url=f"{FRONTEND_URL}?auth=success&email={user_email}")
+
+
+@app.get("/auth/microsoft/status")
+async def microsoft_auth_status():
+    """Check if Microsoft OAuth2 session is active."""
+    tokens = graph_client.get_tokens()
+    if tokens and tokens.get("access_token"):
+        return {
+            "connected": True,
+            "email": tokens.get("email", ""),
+            "auth_method": "oauth2",
+        }
+    return {"connected": False, "email": None, "auth_method": None}
+
+
+@app.post("/auth/microsoft/logout")
+async def microsoft_logout():
+    """Remove Microsoft OAuth2 tokens from session."""
+    global _imap_connection
+    try:
+        if SESSION_FILE.exists():
+            data = json.loads(SESSION_FILE.read_text())
+            data.pop("microsoft_tokens", None)
+            if data.get("auth_method") == "oauth2":
+                data.pop("auth_method", None)
+            SESSION_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+    # Clear in-memory state if it was OAuth2
+    if _credentials.get("auth_method") == "oauth2":
+        _credentials.clear()
+    return {"logged_out": True}
 
 
 # ─── IMAP operation implementations ─────────────────────────────────────────
@@ -1077,7 +1246,25 @@ def _download_attachment_impl(conn: imaplib.IMAP4_SSL, folder: str, uid: str, at
 
 @app.get("/api/folders", response_model=List[FolderInfo])
 async def get_folders():
-    return await _imap_op(_list_folders_impl)
+    auth = get_auth_method()
+    if auth == "oauth2":
+        try:
+            raw_folders = await asyncio.to_thread(graph_client.list_folders)
+            return [
+                FolderInfo(
+                    id=f["id"], name=f["name"],
+                    total_count=f.get("total_count", 0),
+                    unread_count=f.get("unread_count", 0),
+                    child_folder_count=0,
+                )
+                for f in raw_folders
+            ]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Graph API error: {e}")
+    elif auth == "imap":
+        return await _imap_op(_list_folders_impl)
+    else:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
 
 def _load_emails_from_cache(
@@ -1482,16 +1669,140 @@ def _persist_scraped_emails(emails: List[ScrapedEmailData], folder: str = "INBOX
         db.close()
 
 
+def _scrape_via_graph(
+    folder_id: str = None, from_date: str = None, to_date: str = None,
+    sender_filter: str = None, subject_filter: str = None, search: str = None,
+    max_results: int = 50, include_attachments: bool = True,
+) -> List[ScrapedEmailData]:
+    """Scrape emails via Microsoft Graph API — mirrors _scrape_impl logic."""
+    folder = folder_id
+    if not folder:
+        # Get the Inbox folder ID
+        folders = graph_client.list_folders()
+        inbox = next((f for f in folders if f["name"].lower() == "inbox"), None)
+        if inbox:
+            folder = inbox["id"]
+        elif folders:
+            folder = folders[0]["id"]
+        else:
+            return []
+
+    result = graph_client.list_messages(folder, {
+        "top": max_results,
+        "from_date": from_date,
+        "to_date": to_date,
+        "sender_filter": sender_filter,
+        "search": search or subject_filter,
+    })
+
+    all_emails = []
+    for msg_summary in result.get("messages", []):
+        msg_id = msg_summary["id"]
+        full_msg = graph_client.get_message(msg_id)
+
+        text_body = full_msg.get("body_text", "")
+        html_body = full_msg.get("body_html", "")
+
+        scraped_atts = []
+        if include_attachments and full_msg.get("attachments"):
+            for att in full_msg["attachments"]:
+                att_info = ScrapedAttachmentInfo(
+                    name=att.get("name", ""),
+                    content_type=att.get("content_type", ""),
+                    size=att.get("size", 0),
+                    is_inline=att.get("is_inline", False),
+                )
+
+                content_bytes_b64 = att.get("content_bytes")
+                if content_bytes_b64:
+                    try:
+                        content = base64.b64decode(content_bytes_b64)
+                    except Exception:
+                        content = None
+                else:
+                    try:
+                        content = graph_client.download_attachment(msg_id, att["id"])
+                    except Exception:
+                        content = None
+
+                if content:
+                    saved_filename = _save_attachment_with_metadata(
+                        content=content, uid=msg_id[:16], index=0,
+                        original_name=att.get("name", "attachment"),
+                        content_type=att.get("content_type", ""),
+                        email_subject=full_msg.get("subject", ""),
+                        email_sender=full_msg.get("sender_email", ""),
+                        email_date=full_msg.get("date", ""),
+                    )
+                    att_info.saved_path = str(ATTACHMENTS_DIR / saved_filename)
+                    att_info.filename = saved_filename
+                    att_info.download_url = f"/api/attachments/{saved_filename}"
+                    att_info.preview_url = f"/api/attachments/{saved_filename}/preview"
+
+                    # Candidate pipeline: process resumes/CVs
+                    file_type = _classify_file_type(att.get("content_type", ""))
+                    if file_type in ("document", "pdf"):
+                        try:
+                            process_attachment_into_candidate(
+                                attachment_filepath=str(ATTACHMENTS_DIR / saved_filename),
+                                email_uid=msg_id,
+                                email_body=text_body or "",
+                                email_sender=full_msg.get("sender_email", ""),
+                                email_subject=full_msg.get("subject", ""),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Candidate pipeline failed for %s", saved_filename
+                            )
+
+                scraped_atts.append(att_info)
+
+        all_emails.append(ScrapedEmailData(
+            id=msg_id,
+            subject=full_msg.get("subject", ""),
+            sender_name=full_msg.get("sender", ""),
+            sender_email=full_msg.get("sender_email", ""),
+            to=[RecipientInfo(name=r["name"], email=r["email"]) for r in full_msg.get("to", [])],
+            cc=[RecipientInfo(name=r["name"], email=r["email"]) for r in full_msg.get("cc", [])],
+            received=full_msg.get("date", ""),
+            sent=full_msg.get("date", ""),
+            body_type="html" if html_body else "text",
+            body=html_body or text_body,
+            is_read=full_msg.get("is_read", False),
+            has_attachments=full_msg.get("has_attachments", False),
+            importance=full_msg.get("importance", "normal"),
+            internet_message_id=full_msg.get("internet_message_id", ""),
+            conversation_id=full_msg.get("conversation_id", ""),
+            categories=full_msg.get("categories", []),
+            attachments=scraped_atts,
+        ))
+
+    return all_emails
+
+
 @app.post("/api/scrape", response_model=ScrapeResult)
 async def scrape_emails(request: ScrapeRequest):
-    emails = await _imap_op(
-        _scrape_impl,
-        folder_id=request.folder_id, from_date=request.from_date,
-        to_date=request.to_date, sender_filter=request.sender_filter,
-        subject_filter=request.subject_filter, search=request.search,
-        max_results=request.max_results,
-        include_attachments=request.include_attachments,
-    )
+    auth = get_auth_method()
+    if auth == "oauth2":
+        emails = await asyncio.to_thread(
+            _scrape_via_graph,
+            folder_id=request.folder_id, from_date=request.from_date,
+            to_date=request.to_date, sender_filter=request.sender_filter,
+            subject_filter=request.subject_filter, search=request.search,
+            max_results=request.max_results,
+            include_attachments=request.include_attachments,
+        )
+    elif auth == "imap":
+        emails = await _imap_op(
+            _scrape_impl,
+            folder_id=request.folder_id, from_date=request.from_date,
+            to_date=request.to_date, sender_filter=request.sender_filter,
+            subject_filter=request.subject_filter, search=request.search,
+            max_results=request.max_results,
+            include_attachments=request.include_attachments,
+        )
+    else:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
     # ── Persist scraped emails to SQLite (upsert) ──
     _persist_scraped_emails(emails, folder=request.folder_id or "INBOX")
