@@ -1,0 +1,5 @@
+backend-dist/
+build-temp/
+*.spec
+dist/
+node_modules/
