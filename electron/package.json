@@ -6,7 +6,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "prebuild:win": "python build-backend.py && cd ../frontend && npm run build",
+    "prebuild:win": "py -3.11 build-backend.py && cd ../frontend && npm run build",
     "build:win": "electron-builder --win",
     "prebuild:mac": "python3 build-backend.py && cd ../frontend && npm run build",
     "build:mac": "electron-builder --mac",
