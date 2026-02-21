@@ -1,3 +1,8 @@
+import sys
+if sys.version_info >= (3, 12):
+    print("FATAL: Python 3.12+ not supported. Use Python 3.11.")
+    sys.exit(1)
+
 """
 Outlook Mail Scraper - FastAPI Backend (IMAP)
 Connects to Outlook via IMAP to fetch emails, attachments, and metadata.
@@ -25,6 +30,14 @@ from typing import Optional, List
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from pathlib import Path
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+TEMPLATE_FILE = Path(__file__).resolve().parent / ".env.template"
+if not ENV_FILE.exists() and TEMPLATE_FILE.exists():
+    import shutil
+    shutil.copy(TEMPLATE_FILE, ENV_FILE)
+    print("INFO: Created .env from template — please edit with your credentials")
 
 load_dotenv()
 

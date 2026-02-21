@@ -1,7 +1,9 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, shell } = require('electron')
 const { spawn } = require('child_process')
 const path = require('path')
+const fs = require('fs')
 const http = require('http')
+const net = require('net')
 const isDev = require('electron-is-dev')
 
 // ─── Packaged App Paths ─────────────────────────────────────────────
@@ -20,11 +22,34 @@ const FRONTEND_URL = app.isPackaged
   ? `file://${path.join(RESOURCES_PATH, 'frontend', 'index.html')}`
   : (isDev ? 'http://localhost:5173' : 'http://localhost:5173')
 
+// ─── Port Check ─────────────────────────────────────────────────────
+function isPortInUse(port) {
+  return new Promise((resolve) => {
+    const tester = net.createServer()
+      .once('error', () => resolve(true))
+      .once('listening', () => { tester.close(); resolve(false) })
+      .listen(port)
+  })
+}
+
 // ─── Backend Process ─────────────────────────────────────────────────
-function startBackend() {
+async function startBackend() {
+  const portBusy = await isPortInUse(8000)
+  if (portBusy) {
+    console.log('[Backend] Port 8000 already in use — assuming backend already running')
+    return
+  }
+
   const backendPath = app.isPackaged
     ? path.join(RESOURCES_PATH, 'backend')
     : path.join(__dirname, '..', 'backend')
+
+  const envPath = path.join(backendPath, '.env')
+  const templatePath = path.join(backendPath, '.env.template')
+  if (!fs.existsSync(envPath) && fs.existsSync(templatePath)) {
+    fs.copyFileSync(templatePath, envPath)
+    console.log('[Setup] Created .env from template')
+  }
 
   if (app.isPackaged) {
     // Use compiled PyInstaller binary
@@ -53,10 +78,19 @@ function startBackend() {
     )
   }
 
+  let startTime = Date.now()
+
   backendProcess.stdout.on('data', (d) => console.log('[Backend]', d.toString()))
   backendProcess.stderr.on('data', (d) => console.error('[Backend]', d.toString()))
   backendProcess.on('exit', (code) => {
     console.log('[Backend] exited with code', code)
+    if (Date.now() - startTime < 5000) {
+      const { dialog } = require('electron')
+      dialog.showErrorBox(
+        'Backend Failed to Start',
+        'The Mail Scraper backend crashed on startup.\n\nPossible causes:\n• Python not installed\n• Missing packages (run INSTALL_WINDOWS.bat)\n• Port 8000 already in use\n• .env file missing\n\nCheck the logs for details.'
+      )
+    }
     backendProcess = null
   })
 }
@@ -182,7 +216,7 @@ function createTray() {
 // ─── App Lifecycle ───────────────────────────────────────────────────
 app.whenReady().then(async () => {
   createSplashWindow()
-  startBackend()
+  await startBackend()
   try {
     await waitForBackend()
   } catch (err) {

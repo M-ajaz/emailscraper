@@ -1,12 +1,16 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
+# Requires Python 3.11 exactly — do NOT use Python 3.12, 3.13, or 3.14
+# Install: pip install -r requirements.txt --no-cache-dir
+fastapi==0.109.0
+uvicorn==0.27.0
 python-dotenv==1.0.1
 python-multipart==0.0.18
-sqlalchemy==2.0.36
-pdfplumber==0.11.4
-python-docx==1.1.2
-pandas==2.2.3
-openpyxl==3.1.5
-apscheduler
-msal
-requests
+sqlalchemy==2.0.25
+pdfplumber==0.10.3
+python-docx==1.1.0
+pandas==2.1.4
+openpyxl==3.1.2
+apscheduler==3.10.4
+requests==2.31.0
+msal==1.26.0
+pillow==10.2.0
+pyinstaller==6.3.0

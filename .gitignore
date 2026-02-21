@@ -13,6 +13,7 @@ dist/
 # Environment and secrets
 .env
 !.env.example
+!.env.template
 
 # App-specific
 token_cache.json
