@@ -30,16 +30,25 @@ from typing import Optional, List
 from pathlib import Path
 
 from dotenv import load_dotenv
+from database import USER_DATA_DIR
 
-from pathlib import Path
-ENV_FILE = Path(__file__).resolve().parent / ".env"
+# .env lives in user data dir; fall back to backend dir for dev
+ENV_FILE = USER_DATA_DIR / ".env"
+_BACKEND_ENV = Path(__file__).resolve().parent / ".env"
 TEMPLATE_FILE = Path(__file__).resolve().parent / ".env.template"
-if not ENV_FILE.exists() and TEMPLATE_FILE.exists():
-    import shutil
-    shutil.copy(TEMPLATE_FILE, ENV_FILE)
-    print("INFO: Created .env from template — please edit with your credentials")
 
-load_dotenv()
+if not ENV_FILE.exists():
+    if _BACKEND_ENV.exists():
+        # Copy dev .env into user data dir
+        import shutil
+        shutil.copy(_BACKEND_ENV, ENV_FILE)
+        print(f"INFO: Copied .env to {ENV_FILE}")
+    elif TEMPLATE_FILE.exists():
+        import shutil
+        shutil.copy(TEMPLATE_FILE, ENV_FILE)
+        print("INFO: Created .env from template — please edit with your credentials")
+
+load_dotenv(dotenv_path=ENV_FILE)
 
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,7 +58,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from database import (
-    create_tables as _create_db_tables, DB_PATH,
+    create_tables as _create_db_tables, DB_PATH, USER_DATA_DIR,
     SessionLocal, Candidate, JobRequisition, MatchResult, ScrapedEmail, Attachment,
     SchedulerConfig, Notification,
 )
@@ -65,8 +74,8 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 IMAP_HOST = os.getenv("IMAP_SERVER", os.getenv("IMAP_HOST", "imap.gmail.com"))
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 
-ATTACHMENTS_DIR = Path(__file__).resolve().parent / "attachments"
-ATTACHMENTS_DIR.mkdir(exist_ok=True)
+ATTACHMENTS_DIR = USER_DATA_DIR / "attachments"
+ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 _METADATA_FILE = ATTACHMENTS_DIR / "_metadata.json"
 
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "image/bmp"}
@@ -163,7 +172,7 @@ logger = logging.getLogger(__name__)
 # ─── Session persistence ─────────────────────────────────────────────────────
 # TODO: Encrypt credentials at rest (e.g. via OS keyring or Fernet).
 
-SESSION_FILE = Path(__file__).resolve().parent / ".session.json"
+SESSION_FILE = USER_DATA_DIR / ".session.json"
 
 _credentials: dict = {}
 _imap_connection: imaplib.IMAP4_SSL | None = None

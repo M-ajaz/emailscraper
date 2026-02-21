@@ -2,9 +2,11 @@
 Database models for Recruitment Matching.
 
 SQLAlchemy + SQLite backend storing candidates, job requisitions,
-and match results.  DB file: backend/recruitment.db
+and match results.  DB stored in user data dir (AppData on Windows).
 """
 
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +16,23 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-DB_PATH = Path(__file__).resolve().parent / "recruitment.db"
+
+# ─── User data directory (writable without admin rights) ─────────────────────
+
+def get_user_data_dir():
+    if os.name == 'nt':  # Windows
+        base = os.environ.get('APPDATA', Path.home())
+        return Path(base) / 'MailScraper'
+    elif sys.platform == 'darwin':  # macOS
+        return Path.home() / 'Library' / 'Application Support' / 'MailScraper'
+    else:  # Linux
+        return Path.home() / '.local' / 'share' / 'MailScraper'
+
+
+USER_DATA_DIR = get_user_data_dir()
+USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = USER_DATA_DIR / "recruitment.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})

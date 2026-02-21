@@ -33,6 +33,7 @@ cmd = [
     "--specpath", str(ROOT / "electron"),
     "--clean",
     "--noconfirm",
+    "--python-option", "u",
     # Uvicorn hidden imports
     "--hidden-import=uvicorn.logging",
     "--hidden-import=uvicorn.loops",
@@ -71,6 +72,16 @@ cmd = [
     "--collect-all=fastapi",
     "--collect-all=msal",
     "--collect-data=apscheduler",
+    # Copy package metadata (ensures self-contained runtime)
+    "--copy-metadata", "fastapi",
+    "--copy-metadata", "uvicorn",
+    "--copy-metadata", "sqlalchemy",
+    "--copy-metadata", "pdfplumber",
+    "--copy-metadata", "python-docx",
+    "--copy-metadata", "pandas",
+    "--copy-metadata", "apscheduler",
+    "--copy-metadata", "msal",
+    "--copy-metadata", "requests",
     str(BACKEND / "main.py"),
 ]
 
@@ -81,17 +92,34 @@ if result.returncode != 0:
     print("\nPyInstaller FAILED. Check errors above.")
     sys.exit(1)
 
-# Verify output
+# Verify output binary
 binary = DIST / "mailscraper-backend" / ("mailscraper-backend.exe" if sys.platform == "win32" else "mailscraper-backend")
 if not binary.exists():
     print(f"ERROR: Expected binary not found at {binary}")
     sys.exit(1)
 
-# Copy .env.template into the dist folder
+# Copy additional files into dist folder
+dist_dir = DIST / "mailscraper-backend"
+
 template = BACKEND / ".env.template"
 if template.exists():
-    shutil.copy(template, DIST / "mailscraper-backend" / ".env.template")
+    shutil.copy(template, dist_dir / ".env.template")
     print("Copied .env.template to dist")
+
+requirements = BACKEND / "requirements.txt"
+if requirements.exists():
+    shutil.copy(requirements, dist_dir / "requirements.txt")
+    print("Copied requirements.txt to dist (for reference)")
+
+# Verify key files exist in dist
+dist_files = list(dist_dir.iterdir())
+print(f"\nDist contains {len(dist_files)} files/folders")
+
+# Check size — should be at least 50MB for a proper bundle
+total_size = sum(f.stat().st_size for f in dist_dir.rglob("*") if f.is_file())
+print(f"Total bundle size: {total_size / 1024 / 1024:.1f} MB")
+if total_size < 50 * 1024 * 1024:
+    print("WARNING: Bundle seems too small — Python runtime may not be fully included")
 
 print(f"\nBuild successful!")
 print(f"Binary: {binary}")

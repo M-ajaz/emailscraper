@@ -1,9 +1,10 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell } = require('electron')
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain } = require('electron')
 const { spawn } = require('child_process')
 const path = require('path')
 const fs = require('fs')
 const http = require('http')
 const net = require('net')
+const os = require('os')
 const isDev = require('electron-is-dev')
 
 // ─── Packaged App Paths ─────────────────────────────────────────────
@@ -21,6 +22,38 @@ const BACKEND_URL = 'http://localhost:8000'
 const FRONTEND_URL = app.isPackaged
   ? `file://${path.join(RESOURCES_PATH, 'frontend', 'index.html')}`
   : (isDev ? 'http://localhost:5173' : 'http://localhost:5173')
+
+// ─── First Run Detection ────────────────────────────────────────────
+const appDataPath = path.join(os.homedir(), 'AppData', 'Roaming', 'MailScraper')
+const firstRunFlag = path.join(appDataPath, '.first_run')
+
+function isFirstRun() {
+  return fs.existsSync(firstRunFlag)
+}
+
+function completeFirstRun() {
+  if (fs.existsSync(firstRunFlag)) {
+    fs.unlinkSync(firstRunFlag)
+  }
+}
+
+// ─── Setup Wizard ───────────────────────────────────────────────────
+function createSetupWizard() {
+  const wizardWindow = new BrowserWindow({
+    width: 560,
+    height: 620,
+    resizable: false,
+    frame: false,
+    backgroundColor: '#0f1117',
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+    },
+  })
+  wizardWindow.loadFile(path.join(__dirname, 'setup-wizard.html'))
+  wizardWindow.center()
+  return wizardWindow
+}
 
 // ─── Port Check ─────────────────────────────────────────────────────
 function isPortInUse(port) {
@@ -222,10 +255,24 @@ app.whenReady().then(async () => {
   } catch (err) {
     console.error('[Startup]', err.message, '— launching anyway')
   }
-  createWindow()
-  createTray()
-  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close()
-  mainWindow.show()
+
+  if (isFirstRun()) {
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close()
+    const wizard = createSetupWizard()
+    // Wait for wizard to complete before opening main window
+    ipcMain.once('setup-complete', () => {
+      wizard.close()
+      completeFirstRun()
+      createWindow()
+      createTray()
+      mainWindow.show()
+    })
+  } else {
+    createWindow()
+    createTray()
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close()
+    mainWindow.show()
+  }
 })
 
 app.on('window-all-closed', (e) => {

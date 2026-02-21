@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mail Scraper — Setup</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+    background: #0f1117;
+    color: #e4e4e7;
+    height: 100vh;
+    overflow: hidden;
+    user-select: none;
+    -webkit-app-region: drag;
+  }
+
+  button, input, a, .card { -webkit-app-region: no-drag; }
+
+  /* ── Title Bar ─────────────────────────────────────── */
+  .titlebar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 12px 0;
+  }
+  .titlebar-btn {
+    background: none;
+    border: none;
+    color: #71717a;
+    font-size: 18px;
+    cursor: pointer;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.15s;
+  }
+  .titlebar-btn:hover { background: #27272a; color: #e4e4e7; }
+
+  /* ── Progress Dots ─────────────────────────────────── */
+  .progress {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    padding: 12px 0 20px;
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #27272a;
+    transition: background 0.4s, box-shadow 0.4s;
+  }
+  .dot.active {
+    background: #06b6d4;
+    box-shadow: 0 0 8px rgba(6, 182, 212, 0.5);
+  }
+
+  /* ── Steps Container ───────────────────────────────── */
+  .steps-wrapper {
+    position: relative;
+    width: 100%;
+    height: calc(100vh - 80px);
+  }
+  .step {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 40px;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(30px);
+    transition: opacity 0.35s ease, transform 0.35s ease;
+  }
+  .step.active {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(0);
+  }
+  .step.exit-left {
+    opacity: 0;
+    transform: translateX(-30px);
+  }
+
+  /* ── Typography ────────────────────────────────────── */
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: #fafafa;
+    margin-bottom: 6px;
+  }
+  h2 {
+    font-size: 18px;
+    font-weight: 600;
+    color: #fafafa;
+    margin-bottom: 14px;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: #a1a1aa;
+    margin-bottom: 18px;
+  }
+  .description {
+    font-size: 13px;
+    color: #a1a1aa;
+    line-height: 1.6;
+    text-align: center;
+    max-width: 400px;
+    margin-bottom: 28px;
+  }
+
+  /* ── Icon ───────────────────────────────────────────── */
+  .hero-icon {
+    font-size: 56px;
+    margin-bottom: 16px;
+    filter: drop-shadow(0 0 20px rgba(6,182,212,0.3));
+  }
+
+  /* ── Buttons ───────────────────────────────────────── */
+  .btn {
+    padding: 10px 28px;
+    border-radius: 8px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-primary {
+    background: #06b6d4;
+    color: #0f1117;
+  }
+  .btn-primary:hover { background: #22d3ee; }
+  .btn-primary:disabled {
+    background: #164e63;
+    color: #52525b;
+    cursor: not-allowed;
+  }
+  .btn-secondary {
+    background: transparent;
+    color: #a1a1aa;
+    border: 1px solid #27272a;
+  }
+  .btn-secondary:hover { border-color: #52525b; color: #e4e4e7; }
+
+  .btn-row {
+    display: flex;
+    gap: 12px;
+    margin-top: auto;
+    padding-bottom: 32px;
+  }
+
+  /* ── Cards ──────────────────────────────────────────── */
+  .cards {
+    display: flex;
+    gap: 14px;
+    width: 100%;
+    margin-bottom: 18px;
+  }
+  .card {
+    flex: 1;
+    background: #18181b;
+    border: 2px solid #27272a;
+    border-radius: 12px;
+    padding: 18px 14px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .card:hover { border-color: #3f3f46; }
+  .card.selected { border-color: #06b6d4; background: #0c2a32; }
+  .card-icon { font-size: 32px; margin-bottom: 8px; }
+  .card-title { font-size: 14px; font-weight: 600; color: #fafafa; margin-bottom: 4px; }
+  .card-sub { font-size: 11px; color: #71717a; }
+
+  /* ── Form ───────────────────────────────────────────── */
+  .form-area {
+    width: 100%;
+    min-height: 180px;
+  }
+  .form-group {
+    margin-bottom: 12px;
+    text-align: left;
+  }
+  .form-group label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: #a1a1aa;
+    margin-bottom: 5px;
+  }
+  .input-wrap {
+    position: relative;
+    display: flex;
+  }
+  .form-group input {
+    width: 100%;
+    padding: 9px 12px;
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+    color: #fafafa;
+    font-size: 13px;
+    outline: none;
+    transition: border 0.2s;
+  }
+  .form-group input:focus { border-color: #06b6d4; }
+  .form-group input::placeholder { color: #52525b; }
+
+  .eye-toggle {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: #52525b;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .eye-toggle:hover { color: #a1a1aa; }
+
+  .helper-text {
+    font-size: 11px;
+    color: #52525b;
+    margin-top: 6px;
+    line-height: 1.5;
+  }
+  .helper-text a {
+    color: #06b6d4;
+    text-decoration: none;
+  }
+  .helper-text a:hover { text-decoration: underline; }
+
+  /* ── Test Connection ────────────────────────────────── */
+  .test-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+  }
+  .test-status {
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .test-status.success { color: #34d399; }
+  .test-status.error { color: #f87171; }
+
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid #27272a;
+    border-top-color: #06b6d4;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Microsoft Section ─────────────────────────────── */
+  .ms-section {
+    text-align: center;
+    padding: 16px 0;
+  }
+  .btn-microsoft {
+    padding: 10px 24px;
+    border-radius: 8px;
+    border: 1px solid #27272a;
+    background: #18181b;
+    color: #fafafa;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .btn-microsoft:hover { border-color: #52525b; background: #27272a; }
+  .ms-note {
+    font-size: 11px;
+    color: #52525b;
+    margin-top: 12px;
+  }
+
+  /* ── Step 3 ─────────────────────────────────────────── */
+  .checkmark {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #059669, #34d399);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    margin-bottom: 16px;
+    animation: pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    box-shadow: 0 0 30px rgba(52, 211, 153, 0.3);
+  }
+  @keyframes pop {
+    0% { transform: scale(0); }
+    100% { transform: scale(1); }
+  }
+
+  .connected-as {
+    font-size: 13px;
+    color: #71717a;
+    margin-bottom: 24px;
+  }
+  .connected-as span { color: #06b6d4; font-weight: 500; }
+
+  .features {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+  .feature {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 10px;
+    padding: 12px 16px;
+  }
+  .feature-icon { font-size: 22px; flex-shrink: 0; }
+  .feature-text { font-size: 13px; color: #d4d4d8; }
+</style>
+</head>
+<body>
+
+<!-- Title Bar -->
+<div class="titlebar">
+  <button class="titlebar-btn" onclick="window.close()" title="Close">&#10005;</button>
+</div>
+
+<!-- Progress Dots -->
+<div class="progress">
+  <div class="dot active" id="dot1"></div>
+  <div class="dot" id="dot2"></div>
+  <div class="dot" id="dot3"></div>
+</div>
+
+<!-- Steps -->
+<div class="steps-wrapper">
+
+  <!-- STEP 1 — Welcome -->
+  <div class="step active" id="step1">
+    <div class="hero-icon">📬</div>
+    <h1>Welcome to Mail Scraper</h1>
+    <p class="subtitle">Recruitment automation for Protingent India LLP</p>
+    <p class="description">
+      Automatically scrape recruitment emails, extract candidate profiles
+      from resumes, and match them against your open job requirements —
+      all from one simple desktop app.
+    </p>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="goToStep(2)">Get Started</button>
+    </div>
+  </div>
+
+  <!-- STEP 2 — Connect Email -->
+  <div class="step" id="step2">
+    <h2>Connect Your Email Account</h2>
+    <div class="cards">
+      <div class="card" id="card-gmail" onclick="selectProvider('gmail')">
+        <div class="card-icon">📧</div>
+        <div class="card-title">Gmail</div>
+        <div class="card-sub">Use your Gmail account with an app password</div>
+      </div>
+      <div class="card" id="card-outlook" onclick="selectProvider('outlook')">
+        <div class="card-icon">🏢</div>
+        <div class="card-title">Microsoft Outlook</div>
+        <div class="card-sub">Sign in with your Microsoft / Office 365 account</div>
+      </div>
+    </div>
+
+    <div class="form-area">
+      <!-- Gmail Form -->
+      <div id="gmail-form" style="display:none">
+        <div class="form-group">
+          <label>Email Address</label>
+          <input type="email" id="gmail-email" placeholder="you@gmail.com" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="form-group">
+          <label>App Password</label>
+          <div class="input-wrap">
+            <input type="password" id="gmail-password" placeholder="xxxx xxxx xxxx xxxx" autocomplete="off">
+            <button class="eye-toggle" onclick="togglePassword()" id="eye-btn">👁</button>
+          </div>
+          <p class="helper-text">
+            Need an app password? Go to
+            <a href="#" onclick="openExternal('https://myaccount.google.com/apppasswords')">myaccount.google.com</a>
+            &rarr; Security &rarr; App Passwords
+          </p>
+        </div>
+        <div class="test-row">
+          <button class="btn btn-primary" id="test-btn" onclick="testGmailConnection()">Test Connection</button>
+          <div class="test-status" id="test-status"></div>
+        </div>
+      </div>
+
+      <!-- Outlook Form -->
+      <div id="outlook-form" style="display:none">
+        <div class="ms-section">
+          <button class="btn-microsoft" onclick="startMicrosoftAuth()">
+            <svg width="18" height="18" viewBox="0 0 21 21"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
+            Sign in with Microsoft
+          </button>
+          <p class="ms-note">No app password needed — uses secure Microsoft login</p>
+          <div class="test-status" id="ms-status" style="justify-content:center; margin-top:14px"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="goToStep(1)">Back</button>
+      <button class="btn btn-primary" id="next-btn" onclick="goToStep(3)" disabled>Next</button>
+    </div>
+  </div>
+
+  <!-- STEP 3 — All Set -->
+  <div class="step" id="step3">
+    <div class="checkmark">&#10003;</div>
+    <h1>You're all set!</h1>
+    <p class="connected-as">Connected as: <span id="connected-email">—</span></p>
+    <div class="features">
+      <div class="feature">
+        <span class="feature-icon">📥</span>
+        <span class="feature-text">Emails are scraped automatically</span>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">👤</span>
+        <span class="feature-text">Candidate profiles extracted from resumes</span>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">🎯</span>
+        <span class="feature-text">Smart matching against your job requirements</span>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="finishSetup()">Open Mail Scraper</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const { ipcRenderer, shell } = require('electron')
+
+  let currentStep = 1
+  let selectedProvider = null
+  let connectedEmail = ''
+
+  /* ── Navigation ──────────────────────────────────── */
+  function goToStep(n) {
+    const prev = document.getElementById(`step${currentStep}`)
+    prev.classList.remove('active')
+    prev.classList.add('exit-left')
+
+    setTimeout(() => {
+      prev.classList.remove('exit-left')
+    }, 350)
+
+    currentStep = n
+    const next = document.getElementById(`step${n}`)
+    setTimeout(() => {
+      next.classList.add('active')
+    }, 60)
+
+    // Update dots
+    for (let i = 1; i <= 3; i++) {
+      document.getElementById(`dot${i}`).classList.toggle('active', i <= n)
+    }
+  }
+
+  /* ── Provider Selection ──────────────────────────── */
+  function selectProvider(provider) {
+    selectedProvider = provider
+    document.getElementById('card-gmail').classList.toggle('selected', provider === 'gmail')
+    document.getElementById('card-outlook').classList.toggle('selected', provider === 'outlook')
+    document.getElementById('gmail-form').style.display = provider === 'gmail' ? 'block' : 'none'
+    document.getElementById('outlook-form').style.display = provider === 'outlook' ? 'block' : 'none'
+
+    // Reset state
+    document.getElementById('next-btn').disabled = true
+    document.getElementById('test-status').innerHTML = ''
+    document.getElementById('ms-status').innerHTML = ''
+  }
+
+  /* ── Password Toggle ─────────────────────────────── */
+  function togglePassword() {
+    const inp = document.getElementById('gmail-password')
+    const btn = document.getElementById('eye-btn')
+    if (inp.type === 'password') {
+      inp.type = 'text'
+      btn.textContent = '🙈'
+    } else {
+      inp.type = 'password'
+      btn.textContent = '👁'
+    }
+  }
+
+  /* ── Gmail Test Connection ───────────────────────── */
+  async function testGmailConnection() {
+    const email = document.getElementById('gmail-email').value.trim()
+    const password = document.getElementById('gmail-password').value.trim()
+    const status = document.getElementById('test-status')
+    const testBtn = document.getElementById('test-btn')
+
+    if (!email || !password) {
+      status.className = 'test-status error'
+      status.innerHTML = 'Please fill in both fields'
+      return
+    }
+
+    testBtn.disabled = true
+    status.className = 'test-status'
+    status.innerHTML = '<span class="spinner"></span> Testing...'
+
+    try {
+      const res = await fetch('http://localhost:8000/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: email,
+          app_password: password,
+          imap_server: 'imap.gmail.com',
+          imap_port: 993
+        })
+      })
+
+      if (res.ok) {
+        status.className = 'test-status success'
+        status.innerHTML = '&#10003; Connected!'
+        connectedEmail = email
+        document.getElementById('next-btn').disabled = false
+      } else {
+        const data = await res.json().catch(() => ({}))
+        status.className = 'test-status error'
+        status.innerHTML = '&#10007; Connection failed — check your app password'
+      }
+    } catch (err) {
+      status.className = 'test-status error'
+      status.innerHTML = '&#10007; Cannot reach backend — is it running?'
+    }
+
+    testBtn.disabled = false
+  }
+
+  /* ── Microsoft Auth ──────────────────────────────── */
+  async function startMicrosoftAuth() {
+    const status = document.getElementById('ms-status')
+    status.className = 'test-status'
+    status.innerHTML = '<span class="spinner"></span> Opening Microsoft login...'
+
+    try {
+      const res = await fetch('http://localhost:8000/auth/microsoft/url')
+      if (res.ok) {
+        const data = await res.json()
+        if (data.auth_url) {
+          shell.openExternal(data.auth_url)
+          status.innerHTML = '<span class="spinner"></span> Waiting for sign-in...'
+          pollMicrosoftAuth()
+        } else {
+          status.className = 'test-status error'
+          status.innerHTML = '&#10007; Microsoft OAuth not configured on backend'
+        }
+      } else {
+        status.className = 'test-status error'
+        status.innerHTML = '&#10007; Microsoft OAuth not available'
+      }
+    } catch (err) {
+      status.className = 'test-status error'
+      status.innerHTML = '&#10007; Cannot reach backend — is it running?'
+    }
+  }
+
+  async function pollMicrosoftAuth(attempts = 60) {
+    const status = document.getElementById('ms-status')
+    for (let i = 0; i < attempts; i++) {
+      await new Promise(r => setTimeout(r, 2000))
+      try {
+        const res = await fetch('http://localhost:8000/auth/microsoft/status')
+        if (res.ok) {
+          const data = await res.json()
+          if (data.authenticated) {
+            connectedEmail = data.email || 'Microsoft account'
+            status.className = 'test-status success'
+            status.innerHTML = '&#10003; Signed in as ' + connectedEmail
+            document.getElementById('next-btn').disabled = false
+            return
+          }
+        }
+      } catch (e) { /* keep polling */ }
+    }
+    status.className = 'test-status error'
+    status.innerHTML = '&#10007; Sign-in timed out — please try again'
+  }
+
+  /* ── External Links ──────────────────────────────── */
+  function openExternal(url) {
+    shell.openExternal(url)
+  }
+
+  /* ── Finish ──────────────────────────────────────── */
+  function finishSetup() {
+    ipcRenderer.send('setup-complete')
+  }
+
+  /* ── Update Step 3 email on transition ───────────── */
+  const observer = new MutationObserver(() => {
+    if (document.getElementById('step3').classList.contains('active')) {
+      document.getElementById('connected-email').textContent = connectedEmail || '—'
+    }
+  })
+  observer.observe(document.getElementById('step3'), { attributes: true, attributeFilter: ['class'] })
+
+  /* ── Allow Enter key in forms ────────────────────── */
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && currentStep === 2 && selectedProvider === 'gmail') {
+      testGmailConnection()
+    }
+  })
+</script>
+</body>
+</html>
