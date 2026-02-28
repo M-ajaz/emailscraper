@@ -15,7 +15,6 @@ import json
 import re
 import base64
 import logging
-import time
 import mimetypes
 import zipfile
 import imaplib
@@ -24,7 +23,6 @@ import email.header
 import email.utils
 import email.policy
 import asyncio
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from pathlib import Path
@@ -51,6 +49,7 @@ if not ENV_FILE.exists():
 load_dotenv(dotenv_path=ENV_FILE)
 
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -562,23 +561,6 @@ def _parse_fetch_response(data: list) -> list[tuple[int, set, bytes]]:
     return results
 
 
-# ─── Rate Limiter ────────────────────────────────────────────────────────────
-
-RATE_LIMIT_MAX = 100
-RATE_LIMIT_WINDOW = 60
-_rate_limit_store: dict[str, list[float]] = defaultdict(list)
-
-
-def _check_rate_limit(client_ip: str) -> None:
-    now = time.monotonic()
-    window_start = now - RATE_LIMIT_WINDOW
-    timestamps = _rate_limit_store[client_ip]
-    _rate_limit_store[client_ip] = [t for t in timestamps if t > window_start]
-    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
-    _rate_limit_store[client_ip].append(now)
-
-
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 
 scheduler = AsyncIOScheduler()
@@ -600,13 +582,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
-    return await call_next(request)
 
 
 # ─── Database init (idempotent) ──────────────────────────────────────────────
@@ -1084,9 +1059,9 @@ async def outlook_com_status():
     email_addr = ""
     connected = False
     try:
-        running = await asyncio.to_thread(outlook_com.is_outlook_running)
+        running = outlook_com.is_outlook_running()
         if running:
-            info = await asyncio.to_thread(outlook_com.get_account_info)
+            info = outlook_com.get_account_info()
             name = info.get("name", "")
             email_addr = info.get("email", "")
             connected = True
@@ -1105,16 +1080,16 @@ async def outlook_com_status():
 async def outlook_com_connect():
     """Connect to the local Outlook desktop app via COM automation."""
     try:
-        await asyncio.to_thread(outlook_com.get_outlook_app)
-    except OSError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        info = outlook_com.get_account_info()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect to Outlook: {e}")
-
-    try:
-        info = await asyncio.to_thread(outlook_com.get_account_info)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Connected but failed to read account: {e}")
+        err_msg = str(e)
+        if "timed out" in err_msg.lower():
+            return JSONResponse(status_code=503, content={
+                "detail": "Outlook connection timed out. Make sure Outlook is open and try again."
+            })
+        return JSONResponse(status_code=500, content={
+            "detail": f"Failed to connect: {err_msg}"
+        })
 
     email_addr = info.get("email", "")
     name = info.get("name", "")
@@ -1138,7 +1113,7 @@ async def outlook_com_connect():
     _credentials["email"] = email_addr
     _credentials["auth_method"] = "outlook_com"
 
-    return {"connected": True, "email": email_addr, "name": name}
+    return {"connected": True, "email": email_addr, "name": name, "account": {"name": name, "email": email_addr}}
 
 
 @app.post("/auth/outlook/disconnect")
@@ -1381,7 +1356,7 @@ async def get_folders():
             raise HTTPException(status_code=500, detail=f"Graph API error: {e}")
     elif auth == "outlook_com":
         try:
-            raw_folders = await asyncio.to_thread(outlook_com.get_folders)
+            raw_folders = outlook_com.get_folders()
 
             def _flatten(folders: list) -> list:
                 result = []
@@ -1494,9 +1469,7 @@ async def list_emails(
                 "has_attachments": has_attachments,
                 "limit": skip + top,
             }
-            result = await asyncio.to_thread(
-                outlook_com.get_messages, folder_id or "", filters,
-            )
+            result = outlook_com.get_messages(folder_id or "", filters)
             msgs = result.get("messages", [])
             total = result.get("total", len(msgs))
             page = msgs[skip:skip + top]
@@ -2070,8 +2043,7 @@ def _scrape_via_outlook_com(
 async def scrape_emails(request: ScrapeRequest):
     auth = get_auth_method()
     if auth == "outlook_com":
-        emails = await asyncio.to_thread(
-            _scrape_via_outlook_com,
+        emails = _scrape_via_outlook_com(
             folder_id=request.folder_id, from_date=request.from_date,
             to_date=request.to_date, sender_filter=request.sender_filter,
             subject_filter=request.subject_filter, search=request.search,
@@ -2915,8 +2887,7 @@ async def run_scheduled_scrape():
     # Run the scrape via the appropriate backend
     try:
         if auth == "outlook_com":
-            emails = await asyncio.to_thread(
-                _scrape_via_outlook_com,
+            emails = _scrape_via_outlook_com(
                 folder_id=cfg.folder or "INBOX",
                 subject_filter=cfg.subject_filter,
                 max_results=50,

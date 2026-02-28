@@ -100,6 +100,11 @@ if IS_WINDOWS:
         "--hidden-import=pythoncom",
         "--collect-all=win32com",
     ]
+    # Bundle outlook_helper.py alongside the binary (subprocess needs it)
+    helper = BACKEND / "outlook_helper.py"
+    if helper.exists():
+        win32_args.append("--add-data")
+        win32_args.append(f"{helper};.")
     # Insert before the final main.py entry
     insert_pos = cmd.index(str(BACKEND / "main.py"))
     for i, arg in enumerate(win32_args):

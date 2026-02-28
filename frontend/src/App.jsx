@@ -208,8 +208,10 @@ export default function OutlookScraper() {
   const [auth, setAuth] = useState({ loading: true, authenticated: false, user: null });
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [loginLoading, setLoginLoading] = useState(false);
-  const [authMethod, setAuthMethod] = useState("imap"); // "imap" or "oauth2"
+  const [authMethod, setAuthMethod] = useState("imap"); // "imap", "oauth2", or "outlook_com"
   const [msLoginLoading, setMsLoginLoading] = useState(false);
+  const [outlookConnecting, setOutlookConnecting] = useState(false);
+  const [outlookConnected, setOutlookConnected] = useState(null); // null | {email, name} | false
   const [view, setView] = useState("inbox"); // inbox | email | scrape | stats | attachments | candidates | candidateProfile | jobs | recruit-export | settings
   const [folders, setFolders] = useState([]);
   const [emails, setEmails] = useState([]);
@@ -458,7 +460,26 @@ export default function OutlookScraper() {
         checkAuth();
       })();
     } else {
-      checkAuth();
+      // Check Outlook COM auto-login first
+      (async () => {
+        try {
+          const olRes = await fetch(`${API}/auth/outlook/status`);
+          if (olRes.ok) {
+            const olData = await olRes.json();
+            if (olData.connected && olData.outlook_running) {
+              setAuthMethod("outlook_com");
+              setAuth({
+                loading: false, authenticated: true,
+                user: { name: olData.name || olData.email.split("@")[0], email: olData.email },
+              });
+              loadFolders();
+              loadEmails();
+              return;
+            }
+          }
+        } catch (_) {}
+        checkAuth();
+      })();
     }
   }, []);
 
@@ -496,6 +517,22 @@ export default function OutlookScraper() {
 
   const checkAuth = async () => {
     try {
+      // Check Outlook COM session first
+      const olRes = await fetch(`${API}/auth/outlook/status`).catch(() => null);
+      if (olRes && olRes.ok) {
+        const olData = await olRes.json();
+        if (olData.connected && olData.outlook_running) {
+          setAuthMethod("outlook_com");
+          setAuth({
+            loading: false, authenticated: true,
+            user: { name: olData.name || olData.email.split("@")[0], email: olData.email },
+          });
+          loadFolders();
+          loadEmails();
+          return;
+        }
+      }
+
       const res = await fetch(`${API}/auth/status`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -572,13 +609,16 @@ export default function OutlookScraper() {
   };
 
   const logout = async () => {
-    if (authMethod === "oauth2") {
+    if (authMethod === "outlook_com") {
+      await fetch(`${API}/auth/outlook/disconnect`, { method: "POST" });
+    } else if (authMethod === "oauth2") {
       await fetch(`${API}/auth/microsoft/logout`, { method: "POST" });
     } else {
       await fetch(`${API}/auth/logout`, { method: "POST" });
     }
     setAuth({ loading: false, authenticated: false, user: null });
     setAuthMethod("imap");
+    setOutlookConnected(null);
     setEmails([]);
     setFolders([]);
     setSelectedEmail(null);
@@ -1072,6 +1112,136 @@ export default function OutlookScraper() {
         <p style={{ color: theme.textMuted, fontSize: 13, marginBottom: 32, lineHeight: 1.6 }}>
           Connect your Outlook account to browse, search, and export your emails with full metadata and attachments.
         </p>
+
+        {/* ── Outlook Desktop Card (primary option) ────────────────────── */}
+        <div style={{
+          border: "1px solid #0078d4", borderRadius: 12, padding: 24,
+          background: "#1e293b", marginBottom: 24, textAlign: "center",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
+            <svg width="24" height="24" viewBox="0 0 21 21" style={{ flexShrink: 0 }}>
+              <rect x="1" y="1" width="9" height="9" fill="#f25022" />
+              <rect x="11" y="1" width="9" height="9" fill="#7fba00" />
+              <rect x="1" y="11" width="9" height="9" fill="#00a4ef" />
+              <rect x="11" y="11" width="9" height="9" fill="#ffb900" />
+            </svg>
+            <span style={{ fontSize: 16, fontWeight: 700, color: theme.text }}>
+              Connect via Outlook Desktop
+            </span>
+          </div>
+          <p style={{ fontSize: 12, color: theme.textMuted, marginBottom: 12, lineHeight: 1.5 }}>
+            Automatically connect to your locally installed Outlook app — no passwords needed.
+          </p>
+          <span style={{
+            display: "inline-block", padding: "3px 10px", borderRadius: 10,
+            fontSize: 10, fontWeight: 600, letterSpacing: 0.3,
+            background: "#22c55e20", color: "#22c55e", marginBottom: 16,
+          }}>
+            Recommended for Protingent
+          </span>
+
+          {outlookConnected && !outlookConnected.error ? (
+            <div>
+              <div style={{
+                background: "#22c55e15", border: "1px solid #22c55e40",
+                borderRadius: 8, padding: "10px 16px", marginBottom: 12,
+                fontSize: 12, color: "#22c55e",
+              }}>
+                Connected as {outlookConnected.account?.name || outlookConnected.account?.email || "Outlook User"}
+              </div>
+              <button
+                onClick={() => {
+                  setAuthMethod("outlook_com");
+                  setAuth({
+                    loading: false,
+                    authenticated: true,
+                    user: {
+                      name: outlookConnected.account?.name || "Outlook User",
+                      email: outlookConnected.account?.email || "",
+                    },
+                  });
+                  loadFolders();
+                  loadEmails();
+                }}
+                style={{
+                  width: "100%", background: "#0078d4", color: "#fff", border: "none",
+                  padding: "12px 32px", borderRadius: 8, fontSize: 14,
+                  fontWeight: 600, cursor: "pointer", letterSpacing: 0.3,
+                  transition: "all 0.2s", boxShadow: "0 4px 20px rgba(0,120,212,0.3)",
+                }}
+                onMouseEnter={(e) => e.currentTarget.style.background = "#106ebe"}
+                onMouseLeave={(e) => e.currentTarget.style.background = "#0078d4"}
+              >
+                Open Mail Scraper
+              </button>
+            </div>
+          ) : (
+            <div>
+              {outlookConnected?.error && (
+                <div style={{
+                  background: `${theme.danger}15`, border: `1px solid ${theme.danger}40`,
+                  borderRadius: 8, padding: "10px 16px", marginBottom: 12,
+                  fontSize: 12, color: theme.danger,
+                }}>
+                  {outlookConnected.error}
+                </div>
+              )}
+              <button
+                disabled={outlookConnecting}
+                onClick={async () => {
+                  setOutlookConnecting(true);
+                  setOutlookConnected(null);
+                  setError(null);
+                  try {
+                    const res = await fetch(`${API}/auth/outlook/connect`, { method: "POST" });
+                    const data = await res.json();
+                    if (!res.ok || data.error) {
+                      setOutlookConnected({ error: data.detail || data.error || "Failed to connect to Outlook" });
+                    } else {
+                      setOutlookConnected(data);
+                    }
+                  } catch (err) {
+                    setOutlookConnected({ error: err.message || "Failed to connect to Outlook" });
+                  }
+                  setOutlookConnecting(false);
+                }}
+                style={{
+                  width: "100%", background: "#0078d4", color: "#fff", border: "none",
+                  padding: "12px 32px", borderRadius: 8, fontSize: 14,
+                  fontWeight: 600, cursor: outlookConnecting ? "not-allowed" : "pointer",
+                  letterSpacing: 0.3, transition: "all 0.2s",
+                  boxShadow: "0 4px 20px rgba(0,120,212,0.3)",
+                  opacity: outlookConnecting ? 0.6 : 1,
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                }}
+                onMouseEnter={(e) => { if (!outlookConnecting) e.currentTarget.style.background = "#106ebe"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "#0078d4"; }}
+              >
+                {outlookConnecting && (
+                  <div style={{
+                    width: 16, height: 16, border: "2px solid rgba(255,255,255,0.3)",
+                    borderTopColor: "#fff", borderRadius: "50%",
+                    animation: "spin 0.8s linear infinite",
+                  }} />
+                )}
+                {outlookConnecting ? "Connecting..." : "Connect to Outlook"}
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* ── Divider ──────────────────────────────────────────────────── */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: 12,
+          marginBottom: 24,
+        }}>
+          <div style={{ flex: 1, height: 1, background: theme.border }} />
+          <span style={{ fontSize: 10, color: theme.textDim, fontWeight: 600, letterSpacing: 0.5, whiteSpace: "nowrap" }}>
+            Other login options
+          </span>
+          <div style={{ flex: 1, height: 1, background: theme.border }} />
+        </div>
+
         {error && (
           <div style={{
             background: `${theme.danger}15`, border: `1px solid ${theme.danger}40`,
@@ -1449,10 +1619,10 @@ export default function OutlookScraper() {
               display: "inline-flex", alignItems: "center", gap: 4,
               padding: "2px 7px", borderRadius: 4, fontSize: 9, fontWeight: 600,
               letterSpacing: 0.3, textTransform: "uppercase",
-              background: authMethod === "oauth2" ? `${theme.accent}20` : `${theme.textDim}20`,
-              color: authMethod === "oauth2" ? theme.accent : theme.textDim,
+              background: authMethod === "outlook_com" ? "#0078d420" : authMethod === "oauth2" ? `${theme.accent}20` : `${theme.textDim}20`,
+              color: authMethod === "outlook_com" ? "#0078d4" : authMethod === "oauth2" ? theme.accent : theme.textDim,
             }}>
-              {authMethod === "oauth2" && (
+              {(authMethod === "outlook_com" || authMethod === "oauth2") && (
                 <svg width="10" height="10" viewBox="0 0 21 21" style={{ flexShrink: 0 }}>
                   <rect x="1" y="1" width="9" height="9" fill="#f25022" />
                   <rect x="11" y="1" width="9" height="9" fill="#7fba00" />
@@ -1460,7 +1630,7 @@ export default function OutlookScraper() {
                   <rect x="11" y="11" width="9" height="9" fill="#ffb900" />
                 </svg>
               )}
-              {authMethod === "oauth2" ? "Microsoft" : "IMAP"}
+              {authMethod === "outlook_com" ? "Outlook" : authMethod === "oauth2" ? "Microsoft" : "IMAP"}
             </span>
           </div>
         )}
