@@ -4,6 +4,10 @@ import os
 import shutil
 from pathlib import Path
 
+IS_WINDOWS = sys.platform == "win32"
+if not IS_WINDOWS:
+    print("Note: pywin32/Outlook COM only works on Windows — skipping win32 imports on macOS/Linux")
+
 ROOT = Path(__file__).parent.parent
 BACKEND = ROOT / "backend"
 DIST = ROOT / "electron" / "backend-dist"
@@ -65,6 +69,7 @@ cmd = [
     # Data
     "--hidden-import=pandas",
     "--hidden-import=openpyxl",
+    # pywin32 / Outlook COM (Windows only — added conditionally below)
     # Collect all data files
     "--collect-all=pdfplumber",
     "--collect-all=docx",
@@ -84,6 +89,21 @@ cmd = [
     "--copy-metadata", "requests",
     str(BACKEND / "main.py"),
 ]
+
+# ── pywin32 / Outlook COM hidden imports (Windows only) ──────────────────────
+if IS_WINDOWS:
+    win32_args = [
+        "--hidden-import=win32com",
+        "--hidden-import=win32com.client",
+        "--hidden-import=win32com.server",
+        "--hidden-import=pywintypes",
+        "--hidden-import=pythoncom",
+        "--collect-all=win32com",
+    ]
+    # Insert before the final main.py entry
+    insert_pos = cmd.index(str(BACKEND / "main.py"))
+    for i, arg in enumerate(win32_args):
+        cmd.insert(insert_pos + i, arg)
 
 print("Running PyInstaller...")
 result = subprocess.run(cmd, cwd=str(BACKEND))

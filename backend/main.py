@@ -66,6 +66,7 @@ from parsers import extract_text_from_pdf, extract_text_from_docx, extract_entit
 from pipeline import process_attachment_into_candidate
 from matcher import run_match, _candidate_to_dict, _job_to_dict
 import graph_client
+import outlook_com
 import requests as http_requests
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -240,10 +241,21 @@ def _restore_session():
 
 
 def get_auth_method() -> str:
-    """Return current auth method: 'imap', 'oauth2', or 'none'."""
+    """Return current auth method: 'imap', 'oauth2', 'outlook_com', or 'none'."""
     method = _credentials.get("auth_method", "")
     if method:
         return method
+    # Check .session.json for persisted auth_method
+    if SESSION_FILE.exists():
+        try:
+            data = json.loads(SESSION_FILE.read_text())
+            saved_method = data.get("auth_method", "")
+            if saved_method == "outlook_com":
+                _credentials["auth_method"] = "outlook_com"
+                _credentials["email"] = data.get("email", "")
+                return "outlook_com"
+        except (json.JSONDecodeError, OSError):
+            pass
     # Infer from credentials state
     if _credentials.get("password"):
         return "imap"
@@ -1062,6 +1074,90 @@ async def microsoft_logout():
     return {"logged_out": True}
 
 
+# ─── Outlook COM Auth Endpoints ──────────────────────────────────────────────
+
+@app.get("/auth/outlook/status")
+async def outlook_com_status():
+    """Check if the local Outlook desktop app is running and accessible."""
+    running = False
+    name = ""
+    email_addr = ""
+    connected = False
+    try:
+        running = await asyncio.to_thread(outlook_com.is_outlook_running)
+        if running:
+            info = await asyncio.to_thread(outlook_com.get_account_info)
+            name = info.get("name", "")
+            email_addr = info.get("email", "")
+            connected = True
+    except Exception:
+        pass
+    return {
+        "connected": connected,
+        "outlook_running": running,
+        "name": name,
+        "email": email_addr,
+        "auth_method": "outlook_com",
+    }
+
+
+@app.post("/auth/outlook/connect")
+async def outlook_com_connect():
+    """Connect to the local Outlook desktop app via COM automation."""
+    try:
+        await asyncio.to_thread(outlook_com.get_outlook_app)
+    except OSError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to Outlook: {e}")
+
+    try:
+        info = await asyncio.to_thread(outlook_com.get_account_info)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Connected but failed to read account: {e}")
+
+    email_addr = info.get("email", "")
+    name = info.get("name", "")
+
+    # Persist to .session.json
+    try:
+        data = {}
+        if SESSION_FILE.exists():
+            try:
+                data = json.loads(SESSION_FILE.read_text())
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        data["auth_method"] = "outlook_com"
+        data["email"] = email_addr
+        data["name"] = name
+        SESSION_FILE.write_text(json.dumps(data))
+    except Exception:
+        logger.exception("Failed to save Outlook COM session")
+
+    # Update in-memory credentials
+    _credentials["email"] = email_addr
+    _credentials["auth_method"] = "outlook_com"
+
+    return {"connected": True, "email": email_addr, "name": name}
+
+
+@app.post("/auth/outlook/disconnect")
+async def outlook_com_disconnect():
+    """Disconnect from the local Outlook desktop app."""
+    try:
+        if SESSION_FILE.exists():
+            data = json.loads(SESSION_FILE.read_text())
+            if data.get("auth_method") == "outlook_com":
+                data.pop("auth_method", None)
+                data.pop("name", None)
+            SESSION_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+    if _credentials.get("auth_method") == "outlook_com":
+        _credentials.clear()
+    return {"disconnected": True}
+
+
 # ─── IMAP operation implementations ─────────────────────────────────────────
 
 def _list_folders_impl(conn: imaplib.IMAP4_SSL) -> List[FolderInfo]:
@@ -1283,6 +1379,25 @@ async def get_folders():
             ]
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Graph API error: {e}")
+    elif auth == "outlook_com":
+        try:
+            raw_folders = await asyncio.to_thread(outlook_com.get_folders)
+
+            def _flatten(folders: list) -> list:
+                result = []
+                for f in folders:
+                    result.append(FolderInfo(
+                        id=f["id"], name=f["name"],
+                        total_count=f.get("total_count", 0),
+                        unread_count=f.get("unread_count", 0),
+                        child_folder_count=len(f.get("subfolders", [])),
+                    ))
+                    result.extend(_flatten(f.get("subfolders", [])))
+                return result
+
+            return _flatten(raw_folders)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Outlook COM error: {e}")
     elif auth == "imap":
         return await _imap_op(_list_folders_impl)
     else:
@@ -1365,6 +1480,51 @@ async def list_emails(
         return EmailListResponse(
             emails=emails, total=total, next_link=None, skip=skip, top=top,
         )
+
+    auth = get_auth_method()
+
+    # ── Outlook COM path ──
+    if auth == "outlook_com":
+        try:
+            filters = {
+                "keyword": search,
+                "date_from": from_date,
+                "date_to": to_date,
+                "sender": sender,
+                "has_attachments": has_attachments,
+                "limit": skip + top,
+            }
+            result = await asyncio.to_thread(
+                outlook_com.get_messages, folder_id or "", filters,
+            )
+            msgs = result.get("messages", [])
+            total = result.get("total", len(msgs))
+            page = msgs[skip:skip + top]
+            emails = [
+                EmailSummary(
+                    id=m["id"], subject=m["subject"],
+                    sender=m["sender"], sender_email=m["sender_email"],
+                    received=m["date"],
+                    preview=" ".join((m.get("body_text") or "").split())[:200],
+                    is_read=m["is_read"], has_attachments=m["has_attachments"],
+                    importance="normal", folder=m.get("folder_name", ""),
+                    categories=[],
+                )
+                for m in page
+            ]
+            return EmailListResponse(
+                emails=emails, total=total, next_link=None, skip=skip, top=top,
+            )
+        except Exception as e:
+            logger.info("Outlook COM unavailable (%s), falling back to cache", e)
+            emails, total = _load_emails_from_cache(
+                folder_id=folder_id, search=search, sender=sender,
+                has_attachments=has_attachments, is_read=is_read,
+                skip=skip, top=top,
+            )
+            return EmailListResponse(
+                emails=emails, total=total, next_link=None, skip=skip, top=top,
+            )
 
     # ── Default: try IMAP first, fall back to cache on failure ──
     try:
@@ -1802,10 +1962,123 @@ def _scrape_via_graph(
     return all_emails
 
 
+def _scrape_via_outlook_com(
+    folder_id: str = None, from_date: str = None, to_date: str = None,
+    sender_filter: str = None, subject_filter: str = None, search: str = None,
+    max_results: int = 50, include_attachments: bool = True,
+) -> List[ScrapedEmailData]:
+    """Scrape emails via Outlook COM automation — mirrors _scrape_impl logic."""
+    filters = {
+        "date_from": from_date,
+        "date_to": to_date,
+        "sender": sender_filter,
+        "subject": subject_filter,
+        "keyword": search,
+        "limit": max_results,
+    }
+    result = outlook_com.get_messages(folder_id or "", filters)
+    msgs = result.get("messages", [])
+
+    all_emails: List[ScrapedEmailData] = []
+    for m in msgs:
+        msg_id = m["id"]
+        subject = m.get("subject", "") or "(No Subject)"
+        sender_name = m.get("sender", "")
+        sender_email_addr = m.get("sender_email", "")
+        date_str = m.get("date", "")
+        text_body = m.get("body_text", "")
+        html_body = m.get("body_html", "")
+        att_count = m.get("attachment_count", 0)
+
+        scraped_atts: list[ScrapedAttachmentInfo] = []
+        if include_attachments and att_count > 0:
+            try:
+                full_msg = outlook_com.get_message(msg_id)
+                att_list = full_msg.get("attachments", [])
+            except Exception:
+                att_list = []
+
+            for att in att_list:
+                att_idx = att["index"]
+                att_name = att.get("name", f"attachment_{att_idx}")
+                safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", att_name)
+                unique_filename = f"{msg_id[:16]}_{att_idx}_{safe_name}"
+                save_dest = ATTACHMENTS_DIR / unique_filename
+
+                att_info = ScrapedAttachmentInfo(
+                    name=att_name,
+                    content_type=mimetypes.guess_type(att_name)[0] or "application/octet-stream",
+                    size=att.get("size", 0),
+                    is_inline=False,
+                )
+
+                try:
+                    outlook_com.download_attachment(msg_id, att_idx, str(save_dest))
+                    content_type = att_info.content_type
+
+                    # Persist attachment metadata
+                    _save_attachment_with_metadata(
+                        content=save_dest.read_bytes(),
+                        uid=msg_id[:16], index=att_idx,
+                        original_name=att_name, content_type=content_type,
+                        email_subject=subject, email_sender=sender_email_addr,
+                        email_date=date_str,
+                    )
+                    att_info.saved_path = str(save_dest)
+                    att_info.filename = unique_filename
+                    att_info.download_url = f"/api/attachments/{unique_filename}"
+                    att_info.preview_url = f"/api/attachments/{unique_filename}/preview"
+
+                    # Candidate pipeline: process resumes/CVs
+                    file_type = _classify_file_type(content_type)
+                    if file_type in ("document", "pdf"):
+                        try:
+                            process_attachment_into_candidate(
+                                attachment_filepath=str(save_dest),
+                                email_uid=msg_id,
+                                email_body=text_body or "",
+                                email_sender=sender_email_addr,
+                                email_subject=subject,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Candidate pipeline failed for %s", unique_filename
+                            )
+                except Exception:
+                    logger.exception("Failed to save attachment %s", att_name)
+
+                scraped_atts.append(att_info)
+
+        all_emails.append(ScrapedEmailData(
+            id=msg_id, subject=subject,
+            sender_name=sender_name, sender_email=sender_email_addr,
+            to=[], cc=[],
+            received=date_str, sent=date_str,
+            body_type="html" if html_body else "text",
+            body=html_body or text_body,
+            is_read=m.get("is_read", False),
+            has_attachments=att_count > 0,
+            importance="normal",
+            internet_message_id="", conversation_id="",
+            categories=[], attachments=scraped_atts,
+        ))
+
+    return all_emails
+
+
 @app.post("/api/scrape", response_model=ScrapeResult)
 async def scrape_emails(request: ScrapeRequest):
     auth = get_auth_method()
-    if auth == "oauth2":
+    if auth == "outlook_com":
+        emails = await asyncio.to_thread(
+            _scrape_via_outlook_com,
+            folder_id=request.folder_id, from_date=request.from_date,
+            to_date=request.to_date, sender_filter=request.sender_filter,
+            subject_filter=request.subject_filter, search=request.search,
+            max_results=request.max_results,
+            include_attachments=request.include_attachments,
+        )
+    elif auth == "oauth2":
         emails = await asyncio.to_thread(
             _scrape_via_graph,
             folder_id=request.folder_id, from_date=request.from_date,
@@ -2619,9 +2892,17 @@ async def run_scheduled_scrape():
     finally:
         db.close()
 
-    # Check we have IMAP credentials
-    if not _credentials.get("email") or not _credentials.get("password"):
-        logger.warning("Scheduled scrape skipped — no IMAP credentials")
+    auth = get_auth_method()
+
+    # Check we have valid credentials for the active auth method
+    if auth == "outlook_com":
+        pass  # no stored credentials needed — COM talks to local Outlook
+    elif auth == "imap":
+        if not _credentials.get("email") or not _credentials.get("password"):
+            logger.warning("Scheduled scrape skipped — no IMAP credentials")
+            return
+    else:
+        logger.warning("Scheduled scrape skipped — auth method '%s' not supported", auth)
         return
 
     # Count candidates before scrape
@@ -2631,18 +2912,27 @@ async def run_scheduled_scrape():
     finally:
         db.close()
 
-    # Run the scrape via IMAP
+    # Run the scrape via the appropriate backend
     try:
-        emails = await _imap_op(
-            _scrape_impl,
-            folder_id=cfg.folder or "INBOX",
-            subject_filter=cfg.subject_filter,
-            max_results=50,
-            include_attachments=True,
-        )
+        if auth == "outlook_com":
+            emails = await asyncio.to_thread(
+                _scrape_via_outlook_com,
+                folder_id=cfg.folder or "INBOX",
+                subject_filter=cfg.subject_filter,
+                max_results=50,
+                include_attachments=True,
+            )
+        else:
+            emails = await _imap_op(
+                _scrape_impl,
+                folder_id=cfg.folder or "INBOX",
+                subject_filter=cfg.subject_filter,
+                max_results=50,
+                include_attachments=True,
+            )
         _persist_scraped_emails(emails, folder=cfg.folder or "INBOX")
     except Exception:
-        logger.exception("Scheduled scrape IMAP operation failed")
+        logger.exception("Scheduled scrape failed (auth=%s)", auth)
         return
 
     # Count candidates after scrape
